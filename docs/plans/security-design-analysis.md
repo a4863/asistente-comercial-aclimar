@@ -1,6 +1,6 @@
 # Security Design Analysis
 
-**Status:** BLOCKED
+**Status:** READY FOR APPROVAL
 
 ## 1. Objective and context
 
@@ -16,6 +16,7 @@ Analyze security and data-governance requirements for the local, single-user ACL
 - `docs/plans/architecture-decisions.md`
 - `docs/plans/technical-stack-decisions.md`
 - `docs/plans/security-design-task.md`
+- `docs/plans/remote-ai-data-policy.md`
 
 `docs/security.md` and `docs/testing-strategy.md` do not exist.
 
@@ -43,24 +44,26 @@ Analyze security and data-governance requirements for the local, single-user ACL
 
 Source records, observations, provenance, approvals, executions, and audit events require local persistence. Explicit source deletion/redaction must preserve minimal action-history metadata. Logs must record operational state and failures without credentials or unnecessary source bodies. Backup, restoration, local file protection, and temporary-file lifecycle must be specified in `docs/security.md`; automatic cloud backup is outside the MVP.
 
-## 6. Remote-AI disclosure decision required
+## 6. Remote-AI disclosure matrix
 
-**STOP — the exact policy is a material unresolved security decision.**
+Remote AI receives only the smallest context necessary for one concrete analysis operation. It has no execution authority.
 
-The approved documents state only that remote AI may receive the minimum required data and that `docs/security.md` must define allowed data classes. They do not decide whether the following commercial data may leave the device:
-
-| Data class | Required decision |
+| Data class | Policy |
 | --- | --- |
-| Email body and metadata | Allow, prohibit, or allow only minimized/redacted excerpts. |
-| Contact and company identity | Allow identifiable values, require pseudonymization, or prohibit. |
-| Work/project and opportunity/offer context | Allow, minimize/redact, or prohibit. |
-| Manual notes and pasted WhatsApp text | Allow, require confirmation/redaction, or prohibit. |
-| Calendar event data and CRM-derived context | Allow specific fields only, minimize/redact, or prohibit. |
-| Attachments | Must remain prohibited from automatic transmission. |
-| Credentials/tokens and whole database exports | Must remain prohibited. |
-| Logs/audit data and unrelated records | Must remain prohibited unless an explicit future policy says otherwise. |
+| Email body | Allowed with minimization: relevant message, excerpt, or thread subset only. |
+| Email metadata | Allowed only when relevant: sender, relevant recipients, subject, date/time, and necessary thread references. |
+| Contact/company identity | Allowed when materially useful to the specific analysis; pseudonymization is not required by default. |
+| Work/project and opportunity/offer context | Allowed with minimization: relevant identity, status, recent activity, commitments, and next steps only. |
+| Manual notes and pasted WhatsApp text | Allowed when intentionally processed or required by the concrete workflow; only relevant content/context. |
+| Calendar data | Allowed with minimization: relevant title, participants, timing, description, and linked context. |
+| CRM-derived context | Allowed selectively: relevant company/contact/project/opportunity/offer/status and recent commercial context only. |
+| Attachments | Automatic transmission prohibited. Future analysis needs separate scope, explicit user action/approval, and security review. |
+| Credentials/tokens/secrets | Always prohibited. |
+| Whole databases, dumps, exports, mailbox archives | Always prohibited. |
+| Logs and audit data | Prohibited by default in the MVP. |
+| Unrelated records | Always prohibited. |
 
-This choice materially affects privacy, data governance, AI adapter design, user consent, logs, testing, and incident handling. It cannot be inferred from the current documentation.
+When practical, unnecessary passwords, tokens, banking details, unrelated identifiers, and sensitive commercial details must be removed before transmission. AI output remains only candidate facts, inferences, proposals, summaries, questions, commitments, tasks, next steps, or drafts. It cannot approve or execute actions, alter configuration, access credentials, or override rules.
 
 ## 7. Risks
 
@@ -92,6 +95,6 @@ None.
 
 ## 10. Result
 
-**BLOCKED**
+**READY FOR APPROVAL**
 
-Approve the remote-AI disclosure matrix in section 6 before creating `docs/security.md`.
+The approved remote-AI policy resolves the material disclosure ambiguity. The security requirements are sufficiently specified to create `docs/security.md` as a separate approved task.
