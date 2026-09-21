@@ -7,6 +7,9 @@ dependencies = ["fastapi", "uvicorn", "jinja2", "sqlalchemy>=2", "alembic"]
 [project.optional-dependencies]
 test = ["pytest"]
 
+[project.scripts]
+asistente-aclimar = "app.main:run"
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["test"]
