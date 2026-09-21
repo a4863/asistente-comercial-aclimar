@@ -4,7 +4,11 @@
 
 Revisar una implementación terminada frente al plan aprobado, el Scope Lock y la documentación oficial del proyecto.
 
-Este Skill tiene como objetivo determinar si la implementación puede ser aceptada o si requiere correcciones.
+El objetivo es determinar si la implementación puede aceptarse o requiere correcciones.
+
+Review detecta problemas.
+
+Review NO los corrige.
 
 ---
 
@@ -17,471 +21,732 @@ ESTÁ PROHIBIDO:
 - modificar archivos;
 - crear archivos;
 - eliminar archivos;
+- mover o renombrar archivos;
 - corregir código;
 - modificar tests;
 - instalar dependencias;
-- realizar migraciones;
+- modificar dependencias;
+- ejecutar migraciones que alteren datos;
 - modificar bases de datos;
+- modificar buzones;
+- mover, copiar o eliminar correos;
+- crear borradores reales;
+- enviar correos;
+- modificar Google Calendar;
+- modificar datos del CRM;
 - realizar commits;
 - realizar push;
 - realizar merges;
-- ejecutar acciones que modifiquen el estado del repositorio.
+- ejecutar acciones que modifiquen el estado local o externo.
 
-La revisión puede inspeccionar el repositorio y ejecutar comandos de diagnóstico o tests no destructivos cuando sean necesarios.
+La revisión puede:
 
-Review detecta problemas.
+- inspeccionar el repositorio;
+- leer archivos;
+- revisar diffs;
+- ejecutar tests no destructivos;
+- ejecutar comandos de diagnóstico;
+- inspeccionar contratos e interfaces;
+- revisar logs sanitizados;
+- utilizar mocks, fixtures o entornos de prueba.
 
-Review NO los corrige.
+Ante cualquier duda sobre si una operación puede modificar estado:
+
+STOP.
+
+No ejecutar la operación.
 
 ---
 
 ## Preconditions
 
-Antes de comenzar la revisión debe existir:
+Antes de comenzar debe existir:
 
 1. implementación terminada;
 2. plan aprobado;
 3. Scope Lock;
 4. documentación relevante disponible.
 
-Si falta cualquiera de estos elementos:
+Si falta cualquiera:
 
 STOP.
 
-Informar de qué elemento falta y solicitarlo antes de continuar.
+Indicar qué elemento falta.
 
 ---
 
 ## Documentation
 
-La revisión debe consultar, cuando sean relevantes:
+Consultar cuando corresponda:
 
 ```text
 docs/functional-spec.md
 docs/data-model.md
-docs/testing-strategy.md
 docs/architecture.md
+docs/security.md
+docs/testing-strategy.md
+```
 
-También debe consultar:
+También:
 
-plan aprobado
-Scope Lock
+- plan aprobado;
+- Scope Lock.
 
-La documentación aprobada constituye la referencia para evaluar la implementación.
+La documentación aprobada constituye el contrato de revisión.
 
-No asumir que una decisión tomada durante la implementación es correcta si contradice la documentación aprobada.
+No asumir que una decisión tomada durante implementación es válida si contradice la documentación.
 
-Review
+---
 
-Comprobar:
+## Review Areas
 
-cumplimiento funcional;
-cumplimiento del Scope Lock;
-cumplimiento del plan aprobado;
-modelo de datos;
-arquitectura;
-reglas de negocio;
-homologación;
-oportunidades;
-ofertas y versiones;
-dashboard cuando corresponda;
-tests;
-regresiones;
-seguridad;
-dependencias;
-calidad del código;
-documentación;
-ausencia de cambios no autorizados.
+Comprobar, cuando sean aplicables:
 
-No todas las comprobaciones serán aplicables a todas las tareas.
+- cumplimiento funcional;
+- cumplimiento del plan;
+- cumplimiento del Scope Lock;
+- modelo de datos;
+- arquitectura;
+- seguridad;
+- reglas de aprobación;
+- trazabilidad;
+- procedencia;
+- separación entre hechos, inferencias y propuestas;
+- correo IMAP;
+- reconstrucción de hilos;
+- archivado;
+- borradores;
+- Google Calendar;
+- CRM API;
+- notas manuales;
+- WhatsApp manual;
+- seguimiento y prioridades;
+- idempotencia;
+- concurrencia y revalidación;
+- tests;
+- regresiones;
+- dependencias;
+- calidad de código;
+- documentación;
+- ausencia de cambios no autorizados.
 
-Functional Compliance
+No todas las áreas son aplicables a todas las tareas.
 
-Comprobar que la implementación realiza exactamente la funcionalidad definida.
+---
+
+## Functional Compliance
+
+Comprobar que la implementación realiza exactamente lo definido.
 
 Verificar especialmente:
 
-flujos;
-estados;
-transiciones;
-validaciones;
-reglas de negocio;
-relaciones entre entidades;
-criterios de aceptación.
+- flujos;
+- estados;
+- transiciones;
+- validaciones;
+- permisos;
+- aprobaciones;
+- relaciones entre entidades;
+- criterios de aceptación;
+- comportamiento ante ambigüedad;
+- comportamiento ante errores.
 
-No considerar suficiente que:
-
-"el código funciona"
+No es suficiente que "funcione".
 
 Debe funcionar de acuerdo con la especificación aprobada.
 
-Data Model Compliance
+---
+
+## Data Model Compliance
 
 Cuando la tarea afecte a datos, comprobar:
 
-tablas;
-campos;
-relaciones;
-claves;
-restricciones;
-estados;
-integridad referencial;
-migraciones.
+- entidades;
+- campos;
+- relaciones;
+- claves;
+- restricciones;
+- estados;
+- integridad;
+- procedencia;
+- trazabilidad;
+- historial;
+- idempotencia;
+- mecanismo de evolución estructural definido por arquitectura.
 
-No aceptar cambios estructurales que no estén contemplados en el modelo de datos aprobado.
+No aceptar cambios estructurales no autorizados.
 
-Si se detecta una modificación del modelo no autorizada:
+---
 
-Clasificarla como hallazgo.
-
-Architecture Compliance
+## Architecture Compliance
 
 Comprobar que la implementación respeta:
 
-routes
-   ↓
-services
-   ↓
-repositories
-   ↓
-models
+```text
+docs/architecture.md
+```
 
-cuando corresponda.
+Verificar:
 
-Comprobar también:
+- separación de responsabilidades;
+- límites entre componentes;
+- acceso al CRM exclusivamente mediante API;
+- ausencia de acceso directo a la base de datos interna del CRM;
+- uso correcto de almacenamiento local;
+- uso correcto de integraciones externas;
+- ausencia de infraestructura no aprobada;
+- ausencia de patrones o frameworks introducidos fuera del plan.
 
-separación de responsabilidades;
-ausencia de lógica de negocio innecesaria en routes;
-ausencia de acceso directo a base de datos desde templates;
-ausencia de acceso directo a SQLite desde JavaScript;
-uso correcto de migraciones;
-dependencias autorizadas.
+No asumir ninguna arquitectura procedente del CRM anterior.
 
-No aceptar cambios arquitectónicos no incluidos en el plan o autorizados explícitamente.
+---
 
-Business Rules
-
-Comprobar las reglas de negocio definidas en la documentación.
-
-Prestar especial atención a:
-
-Oportunidades
-Oportunidad
-
-no debe confundirse con:
-
-Oferta
-Ofertas
-
-La estructura debe mantenerse:
-
-Oportunidad
-    ↓
-Oferta
-    ↓
-Oferta_Versiones
-
-Debe respetarse la lógica de versiones definida en el modelo.
-
-Homologación
-
-Debe mantenerse la diferencia entre:
-
-estado actual
-
-e:
-
-histórico de eventos
-
-Y no debe asumirse:
-
-documentación completa = homologación
-
-cuando la especificación requiera confirmación explícita.
-
-Testing
-
-Ejecutar los tests relevantes definidos por:
-
-docs/testing-strategy.md
+## Security Compliance
 
 Comprobar:
 
-tests unitarios;
-tests de integración;
-tests de API cuando correspondan;
-tests de regresión;
-casos límite;
-errores esperados.
+- ausencia de credenciales en código;
+- ausencia de secretos en Git;
+- ausencia de contraseñas en texto plano;
+- ausencia de tokens en logs;
+- almacenamiento seguro de credenciales;
+- permisos mínimos necesarios;
+- validación de entradas;
+- tratamiento de datos externos como no confiables;
+- protección frente a instrucciones embebidas en emails, notas, WhatsApp, Calendar o CRM;
+- exposición innecesaria de información comercial;
+- operaciones destructivas;
+- rutas de archivos;
+- errores que puedan filtrar secretos.
 
-No considerar suficiente que exista código de test.
+Cualquier exposición de secretos debe considerarse al menos Major y, si implica riesgo real, Critical.
 
-Los tests deben ejecutarse y su resultado debe quedar registrado.
+---
 
-Regression Check
+## Approval Compliance
+
+Comprobar que cualquier operación que modifique estado externo requiera aprobación cuando así lo establece el MVP.
+
+Especialmente:
+
+- mover correo;
+- crear borrador;
+- crear evento;
+- modificar evento;
+- actualizar CRM.
+
+Verificar que:
+
+- la aprobación corresponde a una acción concreta;
+- no existe autoaprobación persistente no autorizada;
+- una acción rechazada no se ejecuta;
+- una acción aprobada no se reutiliza indebidamente para otra operación;
+- el sistema revalida el objetivo cuando el estado externo puede haber cambiado.
+
+---
+
+## Mailbox Compliance
+
+Cuando la tarea afecte a correo, comprobar:
+
+- uso correcto de IMAP;
+- reconstrucción de hilos según evidencia definida;
+- ausencia de fusiones ambiguas;
+- conservación de procedencia;
+- propuestas de carpeta solo sobre carpetas existentes;
+- no creación automática de carpetas;
+- movimiento solo tras aprobación;
+- ausencia de envío automático;
+- creación de borradores solo tras aprobación;
+- prevención de borradores duplicados;
+- manejo seguro de errores IMAP;
+- recuperación ante cambios del buzón;
+- tests sin modificar correo real salvo autorización explícita.
+
+---
+
+## Thread Reconstruction
+
+Cuando corresponda, revisar que la agrupación prioriza:
+
+- Message-ID;
+- In-Reply-To;
+- References.
+
+El asunto normalizado y contexto solo pueden actuar como evidencia auxiliar.
+
+Si la implementación fusiona conversaciones con evidencia insuficiente, registrar hallazgo.
+
+---
+
+## Draft Safety
+
+Comprobar:
+
+- destino correcto en Drafts/Borradores;
+- aprobación previa;
+- no envío;
+- idempotencia;
+- asociación con la propuesta correspondiente;
+- ausencia de duplicados;
+- manejo de fallos parciales.
+
+---
+
+## Calendar Compliance
+
+Cuando la tarea afecte a Google Calendar:
+
+- lectura conforme a permisos;
+- creación solo con aprobación;
+- modificación solo con aprobación;
+- eliminación fuera del MVP;
+- ausencia de cambios reales en tests salvo autorización;
+- revalidación del evento antes de modificarlo cuando corresponda.
+
+---
+
+## CRM Compliance
+
+Comprobar:
+
+- acceso únicamente vía API;
+- CRM como fuente maestra de empresas, contactos, obras, oportunidades y ofertas;
+- ausencia de acceso directo a `crm.db`;
+- escrituras solo con aprobación;
+- ausencia de borrado automático;
+- ausencia de modificación automática de importes;
+- ausencia de modificación automática de identidad/master data;
+- manejo de conflictos;
+- respeto de fuente de verdad.
+
+---
+
+## Facts, Inferences and Proposals
+
+Comprobar que el sistema distingue correctamente:
+
+- hecho extraído;
+- inferencia;
+- propuesta.
+
+Un hecho debe conservar evidencia.
+
+Una inferencia no debe almacenarse o propagarse como hecho sin confirmación o evidencia posterior.
+
+Una propuesta no debe tratarse como acción ya aprobada.
+
+Cualquier actualización factual basada únicamente en una inferencia debe registrarse como hallazgo.
+
+---
+
+## Provenance and Auditability
+
+Comprobar que puede reconstruirse:
+
+```text
+source
+-> extraction
+-> inference
+-> proposal
+-> approval/rejection
+-> execution result
+```
+
+Verificar:
+
+- identificadores de origen;
+- timestamps;
+- relación entre fuente y extracción;
+- relación entre propuesta y aprobación;
+- relación entre aprobación y ejecución;
+- historial de correcciones;
+- ausencia de sobrescritura silenciosa de eventos ejecutados.
+
+---
+
+## Identity Matching
+
+Cuando corresponda, comprobar:
+
+- preferencia por email exacto;
+- uso de IDs del CRM;
+- uso de relaciones confirmadas;
+- manejo de múltiples coincidencias;
+- ausencia de resolución silenciosa de identidades ambiguas.
+
+Una asociación incorrecta entre cliente/contacto/obra debe clasificarse según impacto.
+
+---
+
+## Follow-up Rules
+
+Comprobar:
+
+- umbrales configurables;
+- precedencia de overrides;
+- respeto de fechas futuras acordadas;
+- generación de alertas/propuestas;
+- ausencia de acciones externas automáticas no autorizadas;
+- consistencia con la especificación.
+
+---
+
+## Idempotency
+
+Revisar operaciones repetibles.
+
+Especial atención a:
+
+- sincronización IMAP;
+- creación de borradores;
+- creación de tareas;
+- registro de actividades;
+- propuestas CRM;
+- eventos Calendar;
+- importación manual de WhatsApp;
+- procesamiento repetido de notas.
+
+Repetir una operación no debe crear duplicados injustificados.
+
+---
+
+## Concurrency and Revalidation
+
+Comprobar comportamiento cuando el estado cambia entre:
+
+- análisis;
+- aprobación;
+- ejecución.
+
+Verificar que las operaciones externas revalidan cuando corresponde.
+
+Si una implementación ejecuta sobre estado obsoleto sin comprobarlo, registrar hallazgo.
+
+---
+
+## Testing
+
+Ejecutar los tests relevantes definidos por:
+
+```text
+docs/testing-strategy.md
+```
+
+Comprobar, cuando corresponda:
+
+- tests unitarios;
+- tests de integración;
+- tests de contrato;
+- tests de API;
+- tests de persistencia;
+- tests de seguridad;
+- tests de idempotencia;
+- tests de regresión;
+- casos límite;
+- errores esperados.
+
+No considerar suficiente que existan tests.
+
+Deben ejecutarse y registrarse los resultados.
+
+---
+
+## External-System Test Safety
+
+Los tests no deben modificar accidentalmente:
+
+- buzón real;
+- Calendar real;
+- CRM real;
+- archivos reales no destinados a test.
+
+Preferir:
+
+- mocks;
+- fixtures;
+- dobles de prueba;
+- entornos aislados.
+
+Si una prueba real está autorizada, revisar que el alcance coincida exactamente con la aprobación.
+
+---
+
+## Regression Check
 
 Comprobar que los cambios no rompen funcionalidades existentes.
 
-Cuando corresponda:
+Ejecutar la suite completa cuando la estrategia de testing así lo requiera.
 
-pytest
+---
 
-debe ejecutarse sobre el conjunto completo de tests.
+## Scope Lock
 
-Si el proyecto tiene tests específicos relacionados con la tarea, deben ejecutarse además de los tests generales.
-
-Scope Lock
-
-Comparar los cambios reales del repositorio con el Scope Lock aprobado.
+Comparar cambios reales con el Scope Lock.
 
 Detectar:
 
-archivos modificados fuera del alcance;
-funcionalidades añadidas;
-refactorizaciones no autorizadas;
-cambios de arquitectura;
-cambios de modelo;
-dependencias añadidas;
-modificaciones de documentación no previstas.
+- archivos fuera del alcance;
+- funcionalidades añadidas;
+- refactorizaciones no autorizadas;
+- cambios de arquitectura;
+- cambios de modelo;
+- dependencias añadidas;
+- cambios de permisos;
+- cambios de documentación no previstos;
+- interacciones externas no autorizadas.
 
-Cualquier cambio fuera del Scope Lock debe registrarse como hallazgo.
+Cualquier desviación debe registrarse.
 
-Out-of-Scope Changes
+---
 
-Detectar cualquier cambio fuera del plan aprobado.
+## Out-of-Scope Changes
 
-Si existe:
+Si existe un cambio fuera del plan:
 
-no corregirlo;
-no revertirlo;
-no modificarlo;
-no ocultarlo.
+- no corregirlo;
+- no revertirlo;
+- no ocultarlo.
 
 Registrarlo como hallazgo.
 
-La revisión no tiene autoridad para modificar la implementación.
+Review no tiene autoridad para modificar implementación.
 
-Documentation Discrepancy
+---
 
-Si existe una discrepancia entre:
+## Documentation Discrepancy
 
-documentación aprobada
+Si existe discrepancia entre documentación e implementación:
 
-y:
+NO asumir que implementación es correcta.
 
-implementación
-
-NO asumir automáticamente que la implementación es correcta.
-
-Determinar si la discrepancia puede resolverse claramente según la documentación.
-
-Si no puede resolverse sin tomar una decisión funcional o arquitectónica:
+Si la discrepancia requiere decisión funcional, arquitectónica, de seguridad o modelo:
 
 STOP.
 
 Presentar:
 
-la discrepancia;
-las alternativas;
-las consecuencias;
-la decisión necesaria.
+- discrepancia;
+- alternativas;
+- consecuencias;
+- decisión necesaria.
 
-No modificar documentación ni código.
+---
 
-Security
-
-Comprobar, cuando sea relevante:
-
-validación de entradas;
-consultas seguras;
-ausencia de credenciales en código;
-ausencia de secretos en Git;
-control de rutas de archivos;
-operaciones destructivas;
-exposición innecesaria de información;
-dependencias introducidas.
-Dependencies
+## Dependencies
 
 Comprobar cualquier dependencia nueva.
 
-Debe existir autorización previa cuando la dependencia no esté contemplada en la arquitectura.
-
 Detectar:
 
-dependencias innecesarias;
-duplicación de librerías;
-cambios de versiones no autorizados;
-dependencias con impacto arquitectónico.
-Code Quality
+- dependencias no autorizadas;
+- dependencias innecesarias;
+- duplicación;
+- cambios de versión oportunistas;
+- impacto arquitectónico;
+- impacto de seguridad/licencia cuando sea relevante.
+
+---
+
+## Code Quality
 
 Evaluar:
 
-claridad;
-simplicidad;
-separación de responsabilidades;
-duplicación;
-complejidad innecesaria;
-nombres;
-mantenibilidad;
-coherencia con la arquitectura.
+- claridad;
+- simplicidad;
+- separación de responsabilidades;
+- duplicación;
+- complejidad innecesaria;
+- nombres;
+- mantenibilidad;
+- coherencia con arquitectura.
 
-No solicitar refactorizaciones puramente estéticas como condición para aceptar una implementación si no afectan a la calidad o al cumplimiento de la arquitectura.
+No exigir cambios puramente estéticos como bloqueo si no afectan cumplimiento, seguridad o mantenibilidad significativa.
 
-Database Safety
+---
 
-Cuando la tarea afecte a la base de datos comprobar:
+## Review Classification
 
-migraciones;
-integridad referencial;
-constraints;
-transacciones;
-compatibilidad con SQLite;
-ausencia de modificaciones manuales no justificadas.
+Clasificar cada hallazgo:
 
-No ejecutar operaciones destructivas durante la revisión.
+### Critical
 
-Review Classification
-
-Clasificar cada hallazgo en una de las siguientes categorías.
-
-Critical
-
-Impide aceptar la implementación.
+Impide aceptar.
 
 Ejemplos:
 
-pérdida o corrupción de datos;
-incumplimiento grave del modelo de datos;
-vulnerabilidad relevante;
-funcionalidad principal incorrecta;
-modificación grave fuera del alcance;
-tests críticos fallando.
-Major
+- pérdida o corrupción de datos;
+- envío de correo no autorizado;
+- modificación externa sin aprobación;
+- exposición de credenciales;
+- acceso directo no autorizado al CRM DB;
+- asociación grave de datos con cliente equivocado;
+- vulnerabilidad relevante;
+- funcionalidad principal incorrecta;
+- tests críticos fallando.
+
+### Major
 
 Debe corregirse antes de aceptar.
 
 Ejemplos:
 
-incumplimiento funcional;
-regla de negocio incorrecta;
-regresión;
-arquitectura incorrecta;
-migración defectuosa;
-test relevante fallando;
-cambio importante fuera del Scope Lock.
-Minor
+- incumplimiento funcional;
+- aprobación insuficiente;
+- regla de negocio incorrecta;
+- regresión;
+- arquitectura incorrecta;
+- idempotencia defectuosa;
+- trazabilidad incompleta relevante;
+- test importante fallando;
+- cambio importante fuera del Scope Lock.
 
-No bloquea la aceptación.
+### Minor
+
+No bloquea aceptación.
 
 Ejemplos:
 
-defecto menor;
-mejora de mantenibilidad;
-pequeña inconsistencia;
-problema no crítico de UX.
-Observation
+- defecto menor;
+- inconsistencia secundaria;
+- mejora de mantenibilidad;
+- problema no crítico de UX.
+
+### Observation
 
 No requiere corrección inmediata.
 
 Puede incluir:
 
-mejora futura;
-deuda técnica menor;
-oportunidad de optimización;
-hallazgo fuera del alcance que no afecta a la aceptación.
-Acceptance Criteria
+- mejora futura;
+- deuda técnica menor;
+- oportunidad de optimización;
+- hallazgo fuera de alcance sin impacto actual.
 
-La implementación solo puede considerarse aceptable si:
+---
 
-[ ] cumple la especificación
-[ ] cumple el plan
-[ ] respeta el Scope Lock
-[ ] respeta el modelo de datos
-[ ] respeta la arquitectura
-[ ] respeta las reglas de negocio
-[ ] tests relevantes GREEN
-[ ] no existen regresiones críticas
-[ ] no existen cambios no autorizados críticos
-[ ] no existen hallazgos Critical
-[ ] no existen hallazgos Major pendientes
-Review Decision
+## Acceptance Criteria
 
-El resultado final debe clasificarse como uno de:
+La implementación solo puede aceptarse si:
 
-ACCEPT
+- [ ] cumple especificación;
+- [ ] cumple plan;
+- [ ] respeta Scope Lock;
+- [ ] respeta modelo de datos;
+- [ ] respeta arquitectura;
+- [ ] respeta seguridad;
+- [ ] respeta reglas de aprobación;
+- [ ] mantiene trazabilidad;
+- [ ] distingue hechos/inferencias/propuestas;
+- [ ] tests relevantes GREEN;
+- [ ] no existen regresiones críticas;
+- [ ] no existen acciones externas no autorizadas;
+- [ ] no existen hallazgos Critical;
+- [ ] no existen hallazgos Major pendientes.
 
-La implementación cumple los criterios y no existen hallazgos bloqueantes.
+---
 
-CHANGES REQUIRED
+## Review Decision
 
-Existen hallazgos Critical o Major que deben corregirse.
+Resultado final:
 
-BLOCKED
+### ACCEPT
 
-No es posible completar la revisión debido a:
+Cumple criterios y no existen hallazgos bloqueantes.
 
-documentación contradictoria;
-falta de plan;
-falta de Scope Lock;
-falta de información;
-decisión funcional pendiente;
-decisión arquitectónica pendiente.
-Output
+### CHANGES REQUIRED
+
+Existen hallazgos Critical o Major.
+
+### BLOCKED
+
+No puede completarse revisión debido a:
+
+- documentación contradictoria;
+- falta de plan;
+- falta de Scope Lock;
+- falta de información;
+- decisión funcional pendiente;
+- decisión arquitectónica pendiente;
+- decisión de seguridad pendiente;
+- imposibilidad de ejecutar tests no destructivos necesarios.
+
+---
+
+## Output
 
 El resultado debe contener:
 
-1. Resumen
-objetivo revisado;
-resultado general.
-2. Documentación consultada
+### 1. Resumen
 
-Indicar los documentos utilizados.
+- objetivo revisado;
+- resultado general.
 
-3. Plan y Scope Lock
+### 2. Documentación consultada
+
+Documentos utilizados.
+
+### 3. Plan y Scope Lock
 
 Indicar si se han respetado.
 
-4. Implementación revisada
+### 4. Implementación revisada
 
-Indicar:
+- archivos;
+- componentes;
+- integraciones;
+- áreas afectadas.
 
-archivos revisados;
-componentes revisados;
-áreas afectadas.
-5. Tests
+### 5. Tests
 
-Indicar:
+- tests ejecutados;
+- resultado;
+- fallos.
 
-tests ejecutados;
-resultado;
-posibles fallos.
-6. Hallazgos
+### 6. Sistemas externos
 
-Clasificar cada uno como:
+Indicar si la implementación interactúa con:
 
-Critical
-Major
-Minor
-Observation
+- IMAP/SMTP;
+- Google Calendar;
+- CRM API;
+- otros.
+
+Indicar si cualquier interacción real fue autorizada.
+
+### 7. Hallazgos
+
+Clasificar:
+
+- Critical;
+- Major;
+- Minor;
+- Observation.
 
 Para cada hallazgo indicar:
 
-descripción;
-archivo;
-impacto;
-referencia a la especificación cuando corresponda.
-7. Decisiones pendientes
+- descripción;
+- archivo/componente;
+- impacto;
+- referencia a especificación cuando corresponda.
 
-Indicar cualquier decisión que deba tomar el usuario.
+### 8. Decisiones pendientes
 
-8. Resultado final
+Cualquier decisión del usuario.
+
+### 9. Resultado final
 
 Uno de:
 
+```text
 ACCEPT
 CHANGES REQUIRED
 BLOCKED
-Final Rule
+```
+
+---
+
+## Final Rule
 
 Review detecta problemas.
 
@@ -493,12 +758,14 @@ Review NO modifica tests.
 
 Review NO modifica documentación.
 
-Review NO modifica el modelo de datos.
+Review NO modifica datos.
 
-Review NO toma decisiones funcionales o arquitectónicas.
+Review NO modifica sistemas externos.
 
-Si la revisión encuentra una ambigüedad que requiere una decisión:
+Review NO toma decisiones funcionales, arquitectónicas, de seguridad o modelo de datos.
+
+Si encuentra una ambigüedad que requiere decisión:
 
 STOP.
 
-Presentar el problema y solicitar confirmación.
+Presentar el problema.
