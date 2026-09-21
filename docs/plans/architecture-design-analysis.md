@@ -1,14 +1,14 @@
 # Architecture Design Analysis
 
-**Status:** BLOCKED
+**Status:** READY FOR APPROVAL
 
 ## 1. Objective
 
-Analyze the architecture required by the approved functional specification and data model, without selecting technology or creating `docs/architecture.md`.
+Prepare a future `docs/architecture.md` from the approved functional specification, data model, and architecture decisions. This analysis does not create that document or implementation.
 
 ## 2. Context
 
-The assistant is local-only, single-user, CRM-API-only, approval-driven, and must preserve provenance, idempotency, and auditability while tolerating unavailable integrations. There is no implementation yet.
+The MVP is a local, single-user commercial assistant on Alejandro's Windows PC. It is a local web application accessed through localhost, not a hosted service or SaaS. The CRM remains API-only and authoritative for master commercial entities.
 
 ## 3. Documentation consulted
 
@@ -19,120 +19,108 @@ The assistant is local-only, single-user, CRM-API-only, approval-driven, and mus
 - `docs/plans/functional-spec-readiness.md`
 - `docs/plans/data-model-design-analysis.md`
 - `docs/plans/architecture-design-task.md`
+- `docs/plans/architecture-decisions.md`
 
 `docs/architecture.md`, `docs/security.md`, and `docs/testing-strategy.md` do not yet exist.
 
 ## 4. Current state
 
-**NO IMPLEMENTATION YET.** There is no application code, dependency manifest, local database, scheduler, integration implementation, or test suite.
+**NO IMPLEMENTATION YET.** No code, dependencies, database, migrations, integrations, scheduler, or tests exist.
 
-## 5. Required component boundaries
+## 5. Proposed components
 
-The approved requirements require, at minimum, these technology-neutral responsibilities:
+- Local web UI, served and accessed only on localhost, for dashboard, review, approval, and integration status.
+- Application/domain workflow for facts, inferences, proposals, lifecycles, follow-up rules, and approval requirements.
+- Embedded relational persistence behind a dedicated data-access boundary, implementing the approved data model.
+- IMAP adapter for incremental mailbox reads, folder discovery, and technical-evidence-based thread reconstruction.
+- Google Calendar adapter for one primary Calendar, reads, reconciliation, and approved writes.
+- CRM API adapter for the explicit read and approved-operation contract only.
+- Manual note and WhatsApp-text ingestion boundary.
+- Provider-agnostic AI service boundary, separate from domain rules.
+- Action-execution boundary for approval, revalidation, idempotency, and audit outcomes.
+- In-process periodic synchronization coordinator with persisted checkpoints.
+- Local configuration, operating-system secure credential-store, audit, and minimal observability boundaries.
 
-- local user interface for review, approval, dashboard, and configuration states;
-- domain workflow for facts, inferences, proposals, lifecycles, and follow-up rules;
-- assistant persistence boundary implementing the approved data model;
-- IMAP ingestion and thread-reconstruction boundary;
-- Calendar read and approved write boundary;
-- CRM API read and approved-operation boundary;
-- manual-note and WhatsApp-ingestion boundary;
-- AI analysis boundary that keeps providers interchangeable and applies data minimization;
-- approval, external-state revalidation, and execution boundary;
-- local scheduling/synchronization boundary;
-- audit/logging and configuration/secret-management boundaries.
+## 6. Boundaries and responsibilities
 
-External data must enter through integration boundaries as untrusted data. Domain logic must remain separate from external protocols and persistence. External mutations must pass through a concrete approved action proposal and revalidation flow.
+External adapters translate untrusted source data into source records and observations. Domain workflows operate on assistant-owned records and must not call external protocols directly. Persistence owns current state, history, idempotency identities, and audit records. The execution boundary is the only route for external mutations and requires a concrete approved action proposal plus target revalidation.
 
-## 6. Required flows
+The AI boundary receives only the minimal permitted analysis context and returns analysis output that remains fact, inference, or proposal according to domain rules. It must not contain provider-specific business logic.
 
-- IMAP synchronization must incrementally observe sources, deduplicate them, reconstruct threads only from sufficient technical evidence, persist source/provenance information, and create internal analysis records without moving or sending mail.
-- Manual notes and pasted WhatsApp text must preserve the original source before analysis.
-- Calendar synchronization must read one configured primary Calendar, reconcile changed/deleted-at-source events, and keep historical references.
-- CRM reads must use only its API; proposed writes must map to explicit permitted API business operations after approval.
-- Analysis must retain separation of extracted facts, inferences, and proposals and retain supporting evidence.
-- Approved external actions must revalidate targets, execute idempotently, and retain outcome/failure evidence.
-- A failed or disconnected integration must expose a degraded/reconnect state without preventing local review of already stored information.
+## 7. Main flows
 
-## 7. Persisted-state, audit, and testing implications
+1. While the application is running, periodic synchronization reads IMAP, Calendar, and permitted CRM context using persisted checkpoints.
+2. Source adapters record source identity/observations, deduplicate, reconcile changed external state, and preserve provenance.
+3. Email threading uses Message-ID, In-Reply-To, and References first; ambiguous messages remain separate.
+4. The domain analysis flow creates internal records and proposals, preserving the distinction between facts, inferences, and proposals.
+5. The UI presents proposed external actions. Approval records one concrete decision.
+6. Execution revalidates the target, performs the approved operation idempotently, and records the result or failure.
+7. After downtime, including weekends, startup uses the last persisted checkpoint to incrementally catch up without a full historical synchronization.
 
-Architecture must use the approved assistant data model for source records, observations, activities, CRM references, derived records, lifecycles, approval decisions, execution results, and append-only audit events. It must support idempotent processing, source deletion/redaction, and audit preservation.
+## 8. IMAP integration
 
-Future testing boundaries must isolate IMAP, Calendar, CRM, AI, clock/scheduling, persistence, and secret storage. Tests must use fixtures/mocks and must not mutate real external systems or use real credentials unnecessarily.
+The IMAP adapter supports one mailbox initially, incremental reads, the configured initial history window, existing-folder discovery, source identities, and synchronization checkpoints. It may not send email, create folders, or move a message except through the approved action-execution flow. Draft creation also requires approval and duplicate prevention.
 
-## 8. Security implications
+## 9. Calendar and CRM API
 
-Credentials must be local, independently manageable per integration, absent from code, Git, plaintext application data, and logs. The architecture must enforce the local-user scope, untrusted-data treatment, integration-specific failure states, and minimal disclosure to any remote AI provider.
+The Calendar adapter reads one configured primary Calendar, retains historical references for changed/deleted-at-source events, and allows only approved create/modify actions. Calendar deletion is outside the MVP.
 
-The concrete storage mechanism and remote-AI policy enforcement require the security design task and cannot be selected here.
+The CRM adapter uses only the explicit CRM API contract. It reads permitted context and maps approved writes only to explicit business operations. It never accesses `crm.db`, scrapes HTML, or performs arbitrary field updates.
 
-## 9. Material architectural ambiguities
+## 10. Persistence and scheduling
 
-**STOP — user decisions are required before `docs/architecture.md` can be designed.**
+Persistence is embedded relational storage with a dedicated data-access layer. This suits the approved relational model, integrity constraints, lifecycle state, provenance, audit history, and idempotency requirements. Database engine, ORM/data-access technology, and migrations remain to be proposed in `docs/architecture.md`, not selected by this analysis.
 
-1. **Local UI and execution model**
-   - Native desktop application.
-   - Local web application accessed in a browser.
-   - Hybrid desktop shell hosting a local web UI.
+Synchronization runs inside the main application process while it is active. The application and CRM are expected to run continuously on weekdays; a separate Windows service is outside the MVP. Integration-specific failures must not terminate the local application, and checkpoints must be persisted.
 
-   This determines packaging, local startup, process lifetime, user interaction, and how background work remains available.
+## 11. Approval, audit, and error isolation
 
-2. **Persistence and data-access approach**
-   - Embedded relational persistence with a data-access layer.
-   - Another local persistence approach that can represent the approved relational/audit model.
+Approval decisions, revalidation evidence, execution attempts, outcomes, failures, and corrections must use the approved data model and append-only audit history. Local review of existing data remains available when IMAP, Calendar, CRM, or AI is unavailable. Each affected integration exposes a clear degraded or reconnect state.
 
-   This affects integrity enforcement, migrations, backup behavior, and implementation complexity. The functional and data-model documents intentionally do not choose an engine, ORM, or migration mechanism.
+## 12. Security, testing, and observability implications
 
-3. **Synchronization and background-execution strategy**
-   - Synchronization runs only while the application is open.
-   - A separately scheduled local process runs synchronization when the UI is closed.
+Credentials use the operating-system secure credential store and remain independently manageable, local, absent from code/Git/plaintext application data/logs. The exact Windows secure-storage technology and the remote-AI data-class policy remain work for architecture and security documentation.
 
-   This affects timeliness of IMAP/Calendar ingestion, startup behavior, credential access, error recovery, and observability.
+Future tests must isolate adapters, clock/scheduler, persistence, AI, and secret storage with mocks/fixtures. They must cover idempotency, revalidation, lifecycle rules, audit history, degraded integrations, and no external mutation without approval.
 
-4. **Credential-storage mechanism**
-   - Operating-system secure credential store.
-   - A different approved local secure-storage mechanism.
+Minimal local observability must expose synchronization/checkpoint status, integration degradation, action outcomes, and failures without logging credentials or unnecessarily retaining sensitive source content.
 
-   This affects lifecycle management, packaging, recovery, and the security boundary. The functional specification explicitly defers the technology choice.
+## 13. Alternatives and ambiguities
 
-5. **AI execution strategy**
-   - Local model execution.
-   - Remote AI provider subject to the approved disclosure limits.
-   - A provider-agnostic boundary supporting a future choice while initially operating without AI automation.
+**None that block the architecture-document design phase.**
 
-   This has material effects on privacy, offline behavior, cost, analysis quality, operational dependencies, and security controls. A remote provider cannot be selected until `docs/security.md` defines allowed data classes.
+The material choices from the prior analysis are approved in `architecture-decisions.md`. Remaining choices—database engine, ORM/data-access technology, migration mechanism, IMAP/Calendar/HTTP libraries, precise Windows secure-store API, AI provider/model, and local packaging—are intentionally deferred for explicit treatment in the architecture or security documents. They must not be silently selected during implementation.
 
-## 10. Risks
+## 14. Risks
 
-- Selecting a UI/runtime model or background strategy implicitly would violate the local operating constraints and affect all integrations.
-- Selecting persistence or secret storage without approval would prematurely determine security, migration, and recovery behavior.
-- Selecting an AI mode without an approved data-disclosure policy risks exposing commercial information.
-- Mixing domain rules with integrations would undermine testability, idempotency, and the approval/revalidation boundary.
-- Treating integration outages as application failures would violate the required degraded-operation behavior.
+- A local web application must remain localhost-only and must not become a hosted backend.
+- In-process synchronization depends on the application remaining active; checkpoint recovery is therefore essential.
+- Remote AI cannot be implemented until security defines allowed data classes.
+- Blurring adapters, domain logic, and persistence would endanger provenance, testability, and approval controls.
+- Credentials and sensitive source content require disciplined logging and retention boundaries.
 
-## 11. Out-of-scope discoveries
+## 15. Out-of-scope discoveries
 
 None.
 
-## 12. Scope Lock
+## 16. Scope Lock
 
 ### In scope
 
-- Analyze architecture.
-- Create only `docs/plans/architecture-design-analysis.md`.
+- Update only `docs/plans/architecture-design-analysis.md`.
 
 ### Out of scope
 
-- `docs/architecture.md`, `docs/security.md`, `docs/testing-strategy.md`, code, dependencies, databases, migrations, real integrations, CRM changes, and changes to functional or data-model documents.
+- `docs/architecture.md`, `docs/security.md`, `docs/testing-strategy.md`, code, dependencies, databases, migrations, integrations, CRM changes, and changes to functional or data-model documents.
 
 ### Restrictions
 
-- No implementation or technology selection.
+- No implementation or technology selection beyond the approved decisions.
 - No change to `main`.
 - Commit and push only to `codex-work`.
 
-## 13. Result
+## 17. Result
 
-**BLOCKED**
+**READY FOR APPROVAL**
 
-Resolve the five material architectural decisions in section 9 before creating `docs/architecture.md`.
+The approved decisions and existing documentation are sufficient to create `docs/architecture.md` as a separately approved design task.
