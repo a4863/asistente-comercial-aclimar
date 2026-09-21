@@ -1,0 +1,1 @@
+"""Local ACLIMAR assistant application."""
