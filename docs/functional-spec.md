@@ -482,6 +482,21 @@ Modification requires explicit approval.
 
 Deleting calendar events is outside the MVP.
 
+## 8.5 Calendar synchronization scope
+
+The MVP synchronizes one configured primary Google Calendar.
+
+All events in the configured synchronization range may be read. The assistant determines commercial relevance during analysis.
+
+If an event is modified directly in Google Calendar, the next synchronization must update the current local representation while preserving relevant provenance and history.
+
+If an event is deleted at source:
+
+- it must no longer be treated as active;
+- its local historical reference must be retained and marked as deleted at source.
+
+Synchronizing multiple calendars is outside the MVP.
+
 ---
 
 # 9. CRM Integration
@@ -505,6 +520,8 @@ The assistant must not maintain an independent competing master record for those
 CRM integration is API-only.
 
 Direct access to the CRM database is prohibited.
+
+The assistant must depend on an explicit CRM API contract and must not depend on CRM internal implementation details.
 
 ---
 
@@ -556,6 +573,47 @@ The assistant must never automatically:
 - overwrite master data;
 - create unsupported business rules.
 
+## 9.7 CRM functional API contract
+
+The CRM API must provide the following read capabilities:
+
+- companies;
+- contacts/interlocutors;
+- works/projects;
+- opportunities;
+- offers;
+- interactions/follow-ups.
+
+Where applicable, the API must support lookup by:
+
+- ID;
+- name;
+- email;
+- company;
+- work/project;
+- status.
+
+Permitted MVP writes, always after explicit user approval, are:
+
+- create a commercial interaction;
+- create a follow-up;
+- update a follow-up;
+- record a next step and date;
+- associate an interaction with company, contact, work, or opportunity;
+- perform an opportunity or offer status transition only through an explicit CRM business operation exposed by the CRM API.
+
+The following are forbidden:
+
+- direct access to `crm.db`;
+- HTML scraping as an integration mechanism;
+- arbitrary database-field updates;
+- deletion of CRM records;
+- automatic company or contact creation;
+- automatic master-data modification;
+- automatic financial amount modification.
+
+If the CRM lacks required API endpoints, they must be implemented separately in the CRM repository through that project's approved Analyze, Plan, Scope Lock, Implement, and Review workflow.
+
 ---
 
 # 10. Activities
@@ -593,6 +651,15 @@ Send homologation documentation before Friday.
 
 ## 11.2 Task lifecycle
 
+The assistant may automatically create internal task records from detected or generated information without user approval, because this does not mutate an external system.
+
+Initial state:
+
+```text
+detected/generated
+→ proposed
+```
+
 Initial functional lifecycle:
 
 ```text
@@ -619,11 +686,21 @@ Customer will send measurements on Thursday.
 
 ## 12.2 Commitment lifecycle
 
+The assistant may automatically create an internal commitment record from detected information without user approval.
+
+Initial state:
+
+```text
+detected
+```
+
 ```text
 detected
 → confirmed
 → fulfilled | overdue | cancelled
 ```
+
+The assistant may automatically mark a confirmed commitment as overdue when its confirmed due date has passed.
 
 ---
 
@@ -636,6 +713,14 @@ A question represents something requiring an answer or resolution.
 ---
 
 ## 13.2 Question lifecycle
+
+The assistant may automatically create an internal question record from detected information without user approval.
+
+Initial state:
+
+```text
+detected
+```
 
 ```text
 detected
@@ -655,11 +740,21 @@ A next step represents the agreed or proposed next commercial action.
 
 ## 14.2 Next-step lifecycle
 
+The assistant may automatically create an internal next-step record from detected information without user approval.
+
+Initial state:
+
+```text
+proposed
+```
+
 ```text
 proposed
 → planned
 → completed | cancelled
 ```
+
+The assistant must not automatically mark tasks, commitments, questions, or next steps as completed, fulfilled, or answered unless explicit later source evidence proves the outcome or Alejandro confirms it.
 
 ---
 
@@ -898,6 +993,20 @@ Names, subject similarity or contextual similarity may generate suggestions.
 
 They must not silently resolve ambiguity.
 
+## 21.1 Confirmed identity links
+
+A user-confirmed identity relationship may be reused across email, manual notes, manually pasted WhatsApp, and Calendar. For example:
+
+```text
+email address
+→ person
+→ CRM contact ID
+```
+
+A confirmed identity link must record its confirmation timestamp and provenance. It does not automatically expire, may be manually corrected, and must preserve correction history rather than silently rewriting history.
+
+Confirmed identity does not automatically determine work, project, or opportunity context when multiple valid contexts exist. Ambiguous business-context relationships still require confirmation.
+
 ---
 
 # 22. Local Assistant Database
@@ -981,6 +1090,23 @@ Executed history must not be silently rewritten.
 
 Corrections should create new audit information.
 
+## 24.1 Source retention and deletion
+
+For the MVP:
+
+- processed email source content is retained locally until the user explicitly requests deletion;
+- original manual notes are retained locally;
+- original manually pasted WhatsApp text is retained locally;
+- Calendar and CRM metadata necessary for traceability is retained locally;
+- attachments are not automatically persisted;
+- there is no automatic age-based deletion.
+
+Manual deletion and export functionality may be designed separately.
+
+Audit history of executed actions must not silently disappear when source content is later removed. When a source is explicitly deleted, audit records may retain event identity, action, timestamps, and outcome without retaining the full deleted content.
+
+Corrections must create new historical information rather than silently rewriting executed history.
+
 ---
 
 # 25. Security Requirements
@@ -992,6 +1118,14 @@ Credentials must never be stored:
 - in source code;
 - in Git;
 - in plaintext database fields.
+
+Each integration must have independently manageable credentials. Credentials must remain local, must not be emitted to logs after configuration, and must never be committed to Git.
+
+The user must be able to revoke or reconfigure one integration without affecting others. Credential expiration or revocation must disable only the affected integration and surface a clear reconnect or configuration state.
+
+Local commercial application data is accessible only within the local user context running the application. Automatic cloud backup of assistant data is outside the MVP.
+
+The exact credential-storage technology and backup mechanism belong to security and architecture design.
 
 ---
 
@@ -1024,6 +1158,21 @@ If an email or other source contains text attempting to instruct the assistant t
 the content must be treated as untrusted source data.
 
 It must not override application rules.
+
+## 25.4 Remote AI data disclosure
+
+A future architecture may select a remote AI provider. If a remote provider is selected:
+
+- only data required for the specific analysis may be transmitted;
+- relevant email text, notes, or CRM context may be transmitted when necessary;
+- credentials must never be transmitted as model context;
+- attachments must not be transmitted automatically;
+- entire databases must not be transmitted;
+- unrelated commercial information must not be transmitted.
+
+`docs/security.md` must explicitly document which classes of data may leave the device before a remote AI provider is implemented.
+
+The AI integration boundary should not make business rules dependent on one model provider.
 
 ---
 
