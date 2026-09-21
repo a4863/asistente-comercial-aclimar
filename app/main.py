@@ -1,9 +1,16 @@
 from fastapi import FastAPI
+from app.config import Settings, load_settings
 from app.web.routes import router
 
-def create_app() -> FastAPI:
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    configured_settings = settings or load_settings()
+    if configured_settings.host != "127.0.0.1":
+        raise ValueError("The application must bind only to 127.0.0.1")
     app = FastAPI(title="Asistente Comercial ACLIMAR")
+    app.state.settings = configured_settings
     app.include_router(router)
     return app
+
 
 app = create_app()
