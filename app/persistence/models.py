@@ -121,3 +121,110 @@ Alert = _model(
         ),
     ),
 )
+
+
+FollowUpPreference = _model(
+    "FollowUpPreference",
+    "follow_up_preference",
+    Column("scope_type", String(30), nullable=False),
+    Column("scope_reference", String(255)),
+    Column("classification", String(50), nullable=False),
+    Column("inactivity_days", Integer),
+    Column("explicit_future_date", DateTime(timezone=True)),
+    Column("provenance", String(255), nullable=False),
+    Column("updated_at", DateTime(timezone=True), default=utcnow, nullable=False),
+    table_args=(
+        CheckConstraint("inactivity_days IS NULL OR inactivity_days >= 0"),
+        Index(
+            "uq_follow_up_preference_scoped",
+            "scope_type",
+            "scope_reference",
+            unique=True,
+            sqlite_where=text("scope_reference IS NOT NULL"),
+        ),
+        Index(
+            "uq_follow_up_preference_global",
+            "scope_type",
+            unique=True,
+            sqlite_where=text("scope_reference IS NULL"),
+        ),
+        Index("ix_follow_up_preference_lookup", "scope_type", "scope_reference"),
+    ),
+)
+
+FollowUpPreferenceHistory = _model(
+    "FollowUpPreferenceHistory",
+    "follow_up_preference_history",
+    Column("follow_up_preference_id", Integer, ForeignKey("follow_up_preference.id"), nullable=False),
+    Column("scope_type", String(30), nullable=False),
+    Column("scope_reference", String(255)),
+    Column("classification", String(50), nullable=False),
+    Column("inactivity_days", Integer),
+    Column("explicit_future_date", DateTime(timezone=True)),
+    Column("changed_at", DateTime(timezone=True), default=utcnow, nullable=False),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("inactivity_days IS NULL OR inactivity_days >= 0"),
+    ),
+)
+
+ActionProposal = _model(
+    "ActionProposal",
+    "action_proposal",
+    Column("action_type", String(100), nullable=False),
+    Column("target_type", String(50), nullable=False),
+    Column("target_reference", String(255), nullable=False),
+    Column("state", String(30), default="pending_approval", nullable=False),
+    Column("idempotency_identity_id", Integer, ForeignKey("idempotency_identity.id"), unique=True, nullable=False),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("state IN ('pending_approval', 'approved', 'rejected', 'executed', 'error')"),
+    ),
+)
+
+ApprovalDecision = _model(
+    "ApprovalDecision",
+    "approval_decision",
+    Column("action_proposal_id", Integer, ForeignKey("action_proposal.id"), unique=True, nullable=False),
+    Column("decision", String(20), nullable=False),
+    Column("decided_at", DateTime(timezone=True), default=utcnow, nullable=False),
+    Column("actor_reference", String(255), nullable=False),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("decision IN ('approved', 'rejected')"),
+    ),
+)
+
+ExecutionResult = _model(
+    "ExecutionResult",
+    "execution_result",
+    Column("action_proposal_id", Integer, ForeignKey("action_proposal.id"), nullable=False),
+    Column("approval_decision_id", Integer, ForeignKey("approval_decision.id")),
+    Column("attempted_at", DateTime(timezone=True), default=utcnow, nullable=False),
+    Column("revalidation_reference", String(255), nullable=False),
+    Column("outcome", String(30), nullable=False),
+    Column("external_result_reference", String(255)),
+    Column("failure_code", String(100)),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("outcome IN ('executed', 'error')"),
+        Index("ix_execution_result_action_attempt", "action_proposal_id", "attempted_at"),
+    ),
+)
+
+OperationalEvidenceLink = _model(
+    "OperationalEvidenceLink",
+    "operational_evidence_link",
+    Column("operational_type", String(30), nullable=False),
+    Column("operational_id", Integer, nullable=False),
+    Column("evidence_type", String(30), nullable=False),
+    Column("evidence_id", Integer),
+    Column("evidence_reference", String(255)),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("operational_type IN ('task', 'commitment', 'question', 'next_step', 'alert', 'action_proposal')"),
+        CheckConstraint("evidence_type IN ('source', 'fact', 'inference', 'proposal', 'user_confirmation')"),
+        CheckConstraint("(evidence_type = 'user_confirmation' AND evidence_id IS NULL AND evidence_reference IS NOT NULL) OR (evidence_type != 'user_confirmation' AND evidence_id IS NOT NULL)"),
+        UniqueConstraint("operational_type", "operational_id", "evidence_type", "evidence_id", "evidence_reference"),
+    ),
+)
