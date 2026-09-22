@@ -2,7 +2,7 @@
 name = "asistente-comercial-aclimar"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["fastapi", "uvicorn", "jinja2", "sqlalchemy>=2", "alembic"]
+dependencies = ["fastapi", "uvicorn", "jinja2", "sqlalchemy>=2", "alembic", "IMAPClient", "keyring"]
 
 [project.optional-dependencies]
 test = ["pytest"]
