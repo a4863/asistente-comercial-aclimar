@@ -11,6 +11,8 @@ from app.persistence.models import (
     ExtractedFact,
     Inference,
     InferenceSupport,
+    IdentityLink,
+    IdentityLinkCorrection,
     ManualNote,
     Proposal,
     ProposalSupport,
@@ -164,6 +166,86 @@ def test_proposal_support_rejects_unknown_type(db_session):
             proposal_id=proposal.id,
             support_type="unknown",
             support_id=1,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def _crm_reference(db_session, external_id):
+    reference = CRMReference(
+        entity_type="contact",
+        external_id=external_id,
+        provenance="test",
+    )
+    db_session.add(reference)
+    db_session.flush()
+    return reference
+
+
+def test_identity_link_allows_only_one_active_confirmed_mapping(db_session):
+    first_crm = _crm_reference(db_session, "contact-1")
+    second_crm = _crm_reference(db_session, "contact-2")
+    first = IdentityLink(
+        identity_type="email",
+        identity_value="person@example.com",
+        crm_reference_id=first_crm.id,
+        status="confirmed",
+        provenance="test",
+    )
+    db_session.add(first)
+    db_session.flush()
+
+    duplicate = IdentityLink(
+        identity_type="email",
+        identity_value="person@example.com",
+        crm_reference_id=second_crm.id,
+        status="confirmed",
+        provenance="test",
+    )
+    db_session.add(duplicate)
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_identity_link_superseded_mapping_allows_replacement(db_session):
+    first_crm = _crm_reference(db_session, "contact-3")
+    second_crm = _crm_reference(db_session, "contact-4")
+    first = IdentityLink(
+        identity_type="email",
+        identity_value="replace@example.com",
+        crm_reference_id=first_crm.id,
+        status="confirmed",
+        superseded_at=datetime.now(timezone.utc),
+        provenance="test",
+    )
+    second = IdentityLink(
+        identity_type="email",
+        identity_value="replace@example.com",
+        crm_reference_id=second_crm.id,
+        status="confirmed",
+        provenance="test",
+    )
+    db_session.add_all([first, second])
+    db_session.flush()
+
+
+def test_identity_link_correction_rejects_self_reference(db_session):
+    crm = _crm_reference(db_session, "contact-5")
+    link = IdentityLink(
+        identity_type="email",
+        identity_value="self@example.com",
+        crm_reference_id=crm.id,
+        status="confirmed",
+        provenance="test",
+    )
+    db_session.add(link)
+    db_session.flush()
+    db_session.add(
+        IdentityLinkCorrection(
+            prior_identity_link_id=link.id,
+            replacement_identity_link_id=link.id,
+            provenance="test",
         )
     )
     with pytest.raises(IntegrityError):
