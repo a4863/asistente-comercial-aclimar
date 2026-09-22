@@ -5,7 +5,7 @@ from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 import re
-from typing import Callable
+from typing import Callable, Iterable
 
 from app.config import IMAPSettings
 from app.security.credentials import CredentialStore
@@ -442,11 +442,15 @@ class ReadOnlyIMAPAdapter:
         body = body if candidate["subtype"] == "plain" else _html_to_text(body)
         return _normalise_text(body or ""), min(len(raw_payload), limit), len(raw_payload) > limit or candidate["size"] > limit
 
-    def fetch_messages(self, uids) -> tuple[FetchedMessage, ...]:
+    def fetch_messages(self, uids: Iterable[int]) -> tuple[FetchedMessage, ...]:
         client = self._require_selected_client()
-        if isinstance(uids, (str, bytes)) or not isinstance(uids, (list, tuple)):
+        if isinstance(uids, (str, bytes)):
             raise IMAPProtocolError("IMAP UIDs are invalid")
-        normalized_uids = tuple(_positive_int(uid) for uid in uids)
+        try:
+            requested_uids = tuple(uids)
+        except TypeError:
+            raise IMAPProtocolError("IMAP UIDs are invalid") from None
+        normalized_uids = tuple(_positive_int(uid) for uid in requested_uids)
         if any(uid is None for uid in normalized_uids):
             raise IMAPProtocolError("IMAP UIDs are invalid")
         normalized_uids = tuple(uid for uid in normalized_uids if uid is not None)
