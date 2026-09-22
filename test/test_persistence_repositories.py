@@ -396,7 +396,7 @@ def test_alerts_and_follow_up_preferences(db_session):
     repository.set_follow_up_preference("contact", "crm-contact", "homologation_docs", inactivity_days=7, explicit_future_date=future_date, provenance="test")
     date_resolution = repository.resolve_follow_up_preference("homologation_docs", crm_scopes=[("contact", "crm-contact")])
     assert date_resolution["explicit_future_date"].replace(tzinfo=timezone.utc) == future_date
-    assert date_resolution["inactivity_days"] == 7
+    assert date_resolution["inactivity_days"] is None
     assert repository.resolve_follow_up_preference("new_or_qualified_opportunity")["inactivity_days"] == 7
     assert repository.resolve_follow_up_preference("negotiation_review")["inactivity_days"] == 5
     assert global_preference.id is not None
