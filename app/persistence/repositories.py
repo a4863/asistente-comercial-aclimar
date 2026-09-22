@@ -983,8 +983,20 @@ class IMAPSyncRepository:
             SourceObservation.source_record_id == source.id,
             SourceObservation.source_version_marker.startswith(prefix),
         ).order_by(SourceObservation.id)))
-        if prior and prior[-1].source_version_marker.endswith(":" + content_digest) and prior[-1].observed_state == location.location_state:
-            return prior[-1], False
+        location_prefix = f"imap:v1:{key}:"
+        latest_location_observation = self.session.scalars(
+            select(SourceObservation).where(
+                SourceObservation.source_record_id == source.id,
+                SourceObservation.source_version_marker.startswith(location_prefix),
+            ).order_by(SourceObservation.id.desc())
+        ).first()
+        if (
+            latest_location_observation is not None
+            and latest_location_observation.source_version_marker.startswith(prefix)
+            and latest_location_observation.source_version_marker.endswith(":" + content_digest)
+            and latest_location_observation.observed_state == location.location_state
+        ):
+            return latest_location_observation, False
         marker = f"{prefix}{len(prior) + 1}:{content_digest}"
         observation = SourceObservation(source_record_id=source.id, observed_at=observed_at, source_version_marker=marker, observed_state=location.location_state, outcome=event_kind, provenance="imap_sync")
         self.session.add(observation)
