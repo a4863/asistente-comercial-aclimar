@@ -119,13 +119,19 @@ class ReadOnlyIMAPAdapter:
         self._client = None
 
     def connect(self) -> None:
-        secret = self._credential_store.get_secret(self._settings.credential_service, self._settings.credential_account)
+        try:
+            secret = self._credential_store.get_secret(
+                self._settings.credential_service,
+                self._settings.credential_account,
+            )
+        except Exception:
+            raise IMAPConnectionError("IMAP credential store is unavailable") from None
         if not secret:
             raise IMAPCredentialMissingError("IMAP credential is unavailable")
         try:
             client = self._client_factory(self._settings.host, port=self._settings.port, ssl=True)
         except Exception as error:
-            raise IMAPConnectionError("IMAP connection could not be created") from error
+            raise IMAPConnectionError("IMAP connection could not be created") from None
         try:
             client.login(self._settings.account, secret)
         except Exception as error:
@@ -134,8 +140,8 @@ class ReadOnlyIMAPAdapter:
             except Exception:
                 pass
             if _is_authentication_error(error):
-                raise IMAPAuthenticationError("IMAP authentication failed") from error
-            raise IMAPProtocolError("IMAP login failed") from error
+                raise IMAPAuthenticationError("IMAP authentication failed") from None
+            raise IMAPProtocolError("IMAP login failed") from None
         self._client = client
 
     def disconnect(self) -> None:
@@ -165,7 +171,7 @@ class ReadOnlyIMAPAdapter:
         except IMAPAdapterError:
             raise
         except Exception as error:
-            raise IMAPProtocolError("IMAP folder listing failed") from error
+            raise IMAPProtocolError("IMAP folder listing failed") from None
 
     def allowed_folders(self) -> tuple[MailboxFolder, ...]:
         discovered = {folder.name: folder for folder in self.list_folders()}
@@ -180,11 +186,11 @@ class ReadOnlyIMAPAdapter:
         try:
             response = client.select_folder(folder_name, readonly=True)
         except Exception as error:
-            raise IMAPProtocolError("IMAP folder selection failed") from error
+            raise IMAPProtocolError("IMAP folder selection failed") from None
         uidvalidity = _positive_int(response.get(b"UIDVALIDITY", response.get("UIDVALIDITY")))
         capabilities = getattr(client, "capabilities", ())
         try:
             normalized_capabilities = _safe_tuple(capabilities() if callable(capabilities) else capabilities)
         except Exception as error:
-            raise IMAPProtocolError("IMAP capability lookup failed") from error
+            raise IMAPProtocolError("IMAP capability lookup failed") from None
         return SelectedMailbox(folder_name, uidvalidity, normalized_capabilities)
