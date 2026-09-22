@@ -43,3 +43,81 @@ FactSourceEvidence = _model("FactSourceEvidence", "fact_source_evidence", Column
 InferenceSupport = _model("InferenceSupport", "inference_support", Column("inference_id", Integer, ForeignKey("inference.id"), nullable=False), Column("support_type", String(30), nullable=False), Column("support_id", Integer, nullable=False), table_args=(UniqueConstraint("inference_id", "support_type", "support_id"), CheckConstraint("support_type IN ('source', 'fact', 'inference')")))
 ProposalSupport = _model("ProposalSupport", "proposal_support", Column("proposal_id", Integer, ForeignKey("proposal.id"), nullable=False), Column("support_type", String(30), nullable=False), Column("support_id", Integer, nullable=False), table_args=(UniqueConstraint("proposal_id", "support_type", "support_id"), CheckConstraint("support_type IN ('source', 'fact', 'inference', 'proposal')")))
 AuditEvent = _model("AuditEvent", "audit_event", Column("event_type", String(100), nullable=False), Column("affected_record_type", String(50), nullable=False), Column("affected_record_id", Integer, nullable=False), Column("actor_or_source", String(100), nullable=False), Column("occurred_at", DateTime(timezone=True), default=utcnow, nullable=False), Column("provenance", String(255), nullable=False), Column("outcome_reference", String(255)), Column("failure_code", String(100)))
+
+
+Task = _model(
+    "Task",
+    "task",
+    Column("title", String(255), nullable=False),
+    Column("state", String(20), default="proposed", nullable=False),
+    Column("due_at", DateTime(timezone=True)),
+    Column("completion_reference", String(255)),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("state IN ('proposed', 'pending', 'completed', 'cancelled')"),
+    ),
+)
+
+Commitment = _model(
+    "Commitment",
+    "commitment",
+    Column("description", String(255), nullable=False),
+    Column("state", String(20), default="detected", nullable=False),
+    Column("due_at", DateTime(timezone=True)),
+    Column("resolution_reference", String(255)),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("state IN ('detected', 'confirmed', 'fulfilled', 'overdue', 'cancelled')"),
+        Index("ix_commitment_due_state", "state", "due_at"),
+    ),
+)
+
+Question = _model(
+    "Question",
+    "question",
+    Column("question_text", Text, nullable=False),
+    Column("state", String(20), default="detected", nullable=False),
+    Column("answer_reference", String(255)),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("state IN ('detected', 'open', 'answered', 'dismissed')"),
+    ),
+)
+
+NextStep = _model(
+    "NextStep",
+    "next_step",
+    Column("description", String(255), nullable=False),
+    Column("state", String(20), default="proposed", nullable=False),
+    Column("target_at", DateTime(timezone=True)),
+    Column("completion_reference", String(255)),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("state IN ('proposed', 'planned', 'completed', 'cancelled')"),
+    ),
+)
+
+Alert = _model(
+    "Alert",
+    "alert",
+    Column("alert_type", String(100), nullable=False),
+    Column("target_type", String(50), nullable=False),
+    Column("target_id", Integer, nullable=False),
+    Column("condition_key", String(255), nullable=False),
+    Column("state", String(20), default="active", nullable=False),
+    Column("priority", String(20)),
+    Column("resolved_at", DateTime(timezone=True)),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("state IN ('active', 'resolved', 'dismissed')"),
+        Index(
+            "uq_alert_active_condition",
+            "alert_type",
+            "target_type",
+            "target_id",
+            "condition_key",
+            unique=True,
+            sqlite_where=text("state = 'active'"),
+        ),
+    ),
+)
