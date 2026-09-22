@@ -12,12 +12,15 @@ from app.persistence.models import (
     Commitment,
     Conversation,
     ConversationMembership,
+    EmailAttachmentMetadata,
+    EmailMessage,
     ExecutionResult,
     ExtractedFact,
     FollowUpPreference,
     FollowUpPreferenceHistory,
     Inference,
     InferenceSupport,
+    IMAPMessageLocation,
     IdentityLink,
     IdentityLinkCorrection,
     IdempotencyIdentity,
@@ -532,3 +535,156 @@ def test_operational_evidence_shape_constraints(
     else:
         with pytest.raises(IntegrityError):
             db_session.flush()
+
+
+def _email_source(db_session, key):
+    record = SourceRecord(
+        source_type="email_message",
+        source_system_scope="imap:account",
+        stable_external_id=key,
+        manual_entry=False,
+        provenance="test",
+    )
+    db_session.add(record)
+    db_session.flush()
+    return record
+
+
+def _email_message(db_session, key="message"):
+    record = EmailMessage(
+        source_record_id=_email_source(db_session, key).id,
+        normalized_message_id="<same@example.com>",
+        normalized_body="body",
+        body_size_bytes=4,
+        provenance="test",
+    )
+    db_session.add(record)
+    db_session.flush()
+    return record
+
+
+def test_email_message_is_one_to_one_with_source_and_message_id_is_not_global(db_session):
+    source = _email_source(db_session, "email-1")
+    first = EmailMessage(
+        source_record_id=source.id,
+        normalized_message_id="<duplicate@example.com>",
+        provenance="test",
+    )
+    second = EmailMessage(
+        source_record_id=_email_source(db_session, "email-2").id,
+        normalized_message_id="<duplicate@example.com>",
+        provenance="test",
+    )
+    db_session.add_all([first, second])
+    db_session.flush()
+
+    db_session.add(EmailMessage(source_record_id=source.id, provenance="test"))
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_email_message_rejects_negative_body_size(db_session):
+    db_session.add(
+        EmailMessage(
+            source_record_id=_email_source(db_session, "negative-body").id,
+            body_size_bytes=-1,
+            provenance="test",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_imap_location_constraints_and_multiple_locations(db_session):
+    message = _email_message(db_session, "locations")
+    first = IMAPMessageLocation(
+        email_message_id=message.id,
+        account_scope="imap:account",
+        folder_name="INBOX",
+        uidvalidity=1,
+        uid=10,
+        last_observed_at=datetime.now(timezone.utc),
+        provenance="test",
+    )
+    second = IMAPMessageLocation(
+        email_message_id=message.id,
+        account_scope="imap:account",
+        folder_name="Sent",
+        uidvalidity=1,
+        uid=10,
+        last_observed_at=datetime.now(timezone.utc),
+        provenance="test",
+    )
+    db_session.add_all([first, second])
+    db_session.flush()
+
+    db_session.add(
+        IMAPMessageLocation(
+            email_message_id=message.id,
+            account_scope="imap:account",
+            folder_name="INBOX",
+            uidvalidity=1,
+            uid=10,
+            last_observed_at=datetime.now(timezone.utc),
+            provenance="test",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+@pytest.mark.parametrize(
+    ("uidvalidity", "uid", "location_state"),
+    [(-1, 1, "active"), (0, 0, "active"), (0, 1, "invalid")],
+)
+def test_imap_location_rejects_invalid_state_or_uid(db_session, uidvalidity, uid, location_state):
+    message = _email_message(db_session, f"invalid-location-{uidvalidity}-{uid}-{location_state}")
+    db_session.add(
+        IMAPMessageLocation(
+            email_message_id=message.id,
+            account_scope="imap:account",
+            folder_name="INBOX",
+            uidvalidity=uidvalidity,
+            uid=uid,
+            location_state=location_state,
+            last_observed_at=datetime.now(timezone.utc),
+            provenance="test",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_attachment_metadata_constraints_and_no_raw_content_fields(db_session):
+    message = _email_message(db_session, "attachments")
+    db_session.add(EmailAttachmentMetadata(email_message_id=message.id, part_index=0, filename="a.pdf", byte_size=1, provenance="test"))
+    db_session.flush()
+    db_session.add(EmailAttachmentMetadata(email_message_id=message.id, part_index=0, provenance="test"))
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+@pytest.mark.parametrize(
+    ("part_index", "byte_size"),
+    [(-1, None), (1, -1)],
+)
+def test_attachment_metadata_rejects_negative_values(db_session, part_index, byte_size):
+    message = _email_message(db_session, f"attachment-{part_index}-{byte_size}")
+    db_session.add(
+        EmailAttachmentMetadata(
+            email_message_id=message.id,
+            part_index=part_index,
+            byte_size=byte_size,
+            provenance="test",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_email_schema_contains_no_raw_mime_or_attachment_bytes():
+    email_columns = set(EmailMessage.__table__.columns.keys())
+    attachment_columns = set(EmailAttachmentMetadata.__table__.columns.keys())
+    prohibited = {"raw_mime", "raw_html", "attachment_bytes", "content_bytes", "blob"}
+    assert prohibited.isdisjoint(email_columns)
+    assert prohibited.isdisjoint(attachment_columns)

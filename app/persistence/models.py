@@ -228,3 +228,62 @@ OperationalEvidenceLink = _model(
         UniqueConstraint("operational_type", "operational_id", "evidence_type", "evidence_id", "evidence_reference"),
     ),
 )
+
+EmailMessage = _model(
+    "EmailMessage",
+    "email_message",
+    Column("source_record_id", Integer, ForeignKey("source_record.id"), unique=True, nullable=False),
+    Column("normalized_message_id", String(998)),
+    Column("sender_address", String(320)),
+    Column("recipient_addresses", Text),
+    Column("subject", String(998)),
+    Column("sent_at", DateTime(timezone=True)),
+    Column("received_at", DateTime(timezone=True)),
+    Column("in_reply_to", String(998)),
+    Column("references_header", Text),
+    Column("normalized_body", Text),
+    Column("body_size_bytes", Integer),
+    Column("content_truncated", Boolean, default=False, nullable=False),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("body_size_bytes IS NULL OR body_size_bytes >= 0"),
+    ),
+)
+
+IMAPMessageLocation = _model(
+    "IMAPMessageLocation",
+    "imap_message_location",
+    Column("email_message_id", Integer, ForeignKey("email_message.id"), nullable=False),
+    Column("account_scope", String(100), nullable=False),
+    Column("folder_name", String(255), nullable=False),
+    Column("uidvalidity", Integer, nullable=False),
+    Column("uid", Integer, nullable=False),
+    Column("location_state", String(20), default="active", nullable=False),
+    Column("last_observed_at", DateTime(timezone=True), nullable=False),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("location_state IN ('active', 'unavailable')"),
+        CheckConstraint("uidvalidity >= 0"),
+        CheckConstraint("uid > 0"),
+        UniqueConstraint("account_scope", "folder_name", "uidvalidity", "uid"),
+        Index("ix_imap_message_location_lookup", "account_scope", "folder_name", "uidvalidity", "uid"),
+    ),
+)
+
+EmailAttachmentMetadata = _model(
+    "EmailAttachmentMetadata",
+    "email_attachment_metadata",
+    Column("email_message_id", Integer, ForeignKey("email_message.id"), nullable=False),
+    Column("part_index", Integer, nullable=False),
+    Column("filename", String(255)),
+    Column("media_type", String(255)),
+    Column("byte_size", Integer),
+    Column("content_id", String(998)),
+    Column("disposition", String(100)),
+    Column("provenance", String(255), nullable=False),
+    table_args=(
+        CheckConstraint("part_index >= 0"),
+        CheckConstraint("byte_size IS NULL OR byte_size >= 0"),
+        UniqueConstraint("email_message_id", "part_index"),
+    ),
+)
