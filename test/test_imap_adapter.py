@@ -5,10 +5,13 @@ from app.integrations.imap_adapter import IMAPAuthenticationError, IMAPConnectio
 
 
 class FakeCredentialStore:
-    def __init__(self, secret):
+    def __init__(self, secret, error=None):
         self.secret = secret
+        self.error = error
 
     def get_secret(self, service, account):
+        if self.error:
+            raise self.error
         return self.secret
 
 
@@ -64,11 +67,24 @@ def test_missing_or_empty_secret_blocks_client_creation(secret):
     assert created == []
 
 
+def test_credential_store_failure_is_normalized_without_sensitive_cause():
+    adapter = ReadOnlyIMAPAdapter(
+        IMAPSettings(),
+        FakeCredentialStore(None, RuntimeError("fake-secret backend failure")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("factory must not run")),
+    )
+    with pytest.raises(IMAPConnectionError) as error:
+        adapter.connect()
+    assert "fake-secret" not in str(error.value)
+    assert error.value.__cause__ is None
+
+
 def test_connection_and_authentication_failures_are_safe():
     adapter, _ = _adapter(factory_error=OSError("fake-secret transport failure"))
     with pytest.raises(IMAPConnectionError) as connection_error:
         adapter.connect()
     assert "fake-secret" not in str(connection_error.value)
+    assert connection_error.value.__cause__ is None
 
     class FakeAuthenticationFailure(Exception):
         pass
@@ -77,6 +93,7 @@ def test_connection_and_authentication_failures_are_safe():
     with pytest.raises(IMAPAuthenticationError) as authentication_error:
         adapter.connect()
     assert "fake-secret" not in str(authentication_error.value)
+    assert authentication_error.value.__cause__ is None
 
 
 def test_generic_login_failure_maps_to_protocol_error_and_cleans_up():
