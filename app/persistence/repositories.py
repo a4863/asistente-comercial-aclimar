@@ -701,10 +701,20 @@ class OperationalRepository:
                 break
         else:
             preference = None
+        explicit_future_date = preference.explicit_future_date if preference else None
+        inactivity_days = (
+            None
+            if explicit_future_date is not None
+            else (
+                preference.inactivity_days
+                if preference and preference.inactivity_days is not None
+                else FOLLOW_UP_DEFAULTS.get(classification)
+            )
+        )
         return {
             "preference": preference,
-            "explicit_future_date": preference.explicit_future_date if preference else None,
-            "inactivity_days": preference.inactivity_days if preference and preference.inactivity_days is not None else FOLLOW_UP_DEFAULTS.get(classification),
+            "explicit_future_date": explicit_future_date,
+            "inactivity_days": inactivity_days,
         }
 
     def add_operational_evidence(self, operational_type: str, operational_id: int, evidence_type: str, evidence_id: int | None = None, evidence_reference: str | None = None, provenance: str = "system"):
