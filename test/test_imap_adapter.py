@@ -1,3 +1,5 @@
+from datetime import date
+
 import pytest
 
 from app.config import IMAPSettings
@@ -16,11 +18,14 @@ class FakeCredentialStore:
 
 
 class FakeClient:
-    def __init__(self, folders=None, select_response=None, login_error=None):
+    def __init__(self, folders=None, select_response=None, login_error=None, search_result=None, fetch_responses=None):
         self.folders = folders or [((), "/", "INBOX"), ((b"\\Sent",), "/", "Sent")]
         self.select_response = {b"UIDVALIDITY": b"7"} if select_response is None else select_response
         self.login_error = login_error
         self.login_calls, self.select_calls, self.logout_calls = [], [], 0
+        self.search_result = [12, 13] if search_result is None else search_result
+        self.fetch_responses = list(fetch_responses or [])
+        self.search_calls, self.fetch_calls = [], []
         self.capabilities = (b"IMAP4rev1", b"UIDPLUS")
 
     def login(self, account, secret):
@@ -37,6 +42,16 @@ class FakeClient:
     def select_folder(self, name, readonly):
         self.select_calls.append((name, readonly))
         return self.select_response
+
+    def search(self, criteria):
+        self.search_calls.append(criteria)
+        return self.search_result
+
+    def fetch(self, uids, fields):
+        self.fetch_calls.append((uids, fields))
+        if not self.fetch_responses:
+            raise AssertionError("unexpected fake fetch")
+        return self.fetch_responses.pop(0)
 
 
 def _adapter(secret="fake-secret", client=None, factory_error=None):
@@ -142,5 +157,124 @@ def test_invalid_or_missing_uidvalidity_is_none_and_no_mutators_are_exposed():
         adapter.connect()
         assert adapter.select_read_only("INBOX").uidvalidity is None
     adapter, _ = _adapter()
-    for name in ("append", "copy", "move", "delete", "rename_folder", "create_folder", "search_uids", "fetch_messages"):
+    for name in ("append", "copy", "move", "delete", "rename_folder", "create_folder"):
         assert not hasattr(adapter, name)
+
+
+def _selected_adapter(client, max_body_bytes=64):
+    adapter, _ = _adapter(client=client)
+    adapter._settings = IMAPSettings(max_body_bytes=max_body_bytes)
+    adapter.connect()
+    adapter.select_read_only("INBOX")
+    return adapter
+
+
+def _headers(**overrides):
+    values = {
+        "From": "Sender <sender@example.test>",
+        "To": "One <one@example.test>, two@example.test",
+        "Subject": "=?utf-8?q?Hello_=E2=9C=93?=",
+        "Date": "Tue, 02 Jan 2024 12:00:00 +0000",
+        "Message-ID": "<message@example.test>",
+        "In-Reply-To": "<parent@example.test>",
+        "References": "<root@example.test> <parent@example.test>",
+    }
+    values.update(overrides)
+    return b"".join(f"{name}: {value}\r\n".encode() for name, value in values.items()) + b"\r\n"
+
+
+def _top_response(uid=12, structure=None, headers=None):
+    return {uid: {b"BODY.PEEK[HEADER]": headers or _headers(), b"BODYSTRUCTURE": structure or {"type": "text", "subtype": "plain", "part": "1", "size": 5}}}
+
+
+def _body_response(uid=12, part="1", mime=b"Content-Type: text/plain; charset=utf-8\r\n", body=b"hello", length=65):
+    return {uid: {f"BODY.PEEK[{part}.MIME]".encode(): mime, f"BODY.PEEK[{part}]<0.{length}>".encode(): body}}
+
+
+def test_uid_search_requires_selected_mailbox_and_uses_all_or_since():
+    client = FakeClient()
+    adapter, _ = _adapter(client=client)
+    adapter.connect()
+    with pytest.raises(IMAPProtocolError):
+        adapter.search_uids()
+    adapter.select_read_only("INBOX")
+    assert adapter.search_uids() == (12, 13)
+    assert adapter.search_uids(date(2024, 1, 2)) == (12, 13)
+    assert client.search_calls == [["ALL"], ["SINCE", date(2024, 1, 2)]]
+
+
+def test_invalid_server_or_requested_uids_are_safe_and_do_not_fetch():
+    client = FakeClient(search_result=[12, "bad"])
+    adapter = _selected_adapter(client)
+    with pytest.raises(IMAPProtocolError) as error:
+        adapter.search_uids()
+    assert error.value.__cause__ is None
+    with pytest.raises(IMAPProtocolError):
+        adapter.fetch_messages([12, 0])
+    assert client.fetch_calls == []
+
+
+def test_fetch_is_selective_and_normalizes_headers_and_plain_body():
+    client = FakeClient(fetch_responses=[_top_response(), _body_response(body=b"hello\r\nworld")])
+    adapter = _selected_adapter(client)
+    message = adapter.fetch_messages([12])[0]
+    assert message.uid == 12
+    assert message.normalized_message_id == "<message@example.test>"
+    assert message.sender_address == "sender@example.test"
+    assert message.recipient_addresses == ("one@example.test", "two@example.test")
+    assert message.subject == "Hello \u2713"
+    assert message.in_reply_to == "<parent@example.test>"
+    assert message.references_header == "<root@example.test> <parent@example.test>"
+    assert message.normalized_body == "hello\nworld"
+    assert client.fetch_calls[0][1] == ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"]
+    assert "BODY.PEEK[1]<0.65>" in client.fetch_calls[1][1]
+    assert all("RFC822" not in str(field) and "BODY[]" not in str(field) for _, fields in client.fetch_calls for field in fields)
+
+
+def test_fetch_prefers_plain_extracts_nested_attachment_metadata_and_never_fetches_attachment():
+    structure = {
+        "type": "multipart", "subtype": "mixed", "parts": [
+            {"type": "multipart", "subtype": "alternative", "parts": [
+                {"type": "text", "subtype": "html", "size": 30},
+                {"type": "text", "subtype": "plain", "size": 5},
+            ]},
+            {"type": "application", "subtype": "pdf", "filename": "quote.pdf", "size": 99, "disposition": "attachment", "content_id": "cid-1"},
+        ],
+    }
+    client = FakeClient(fetch_responses=[_top_response(structure=structure), _body_response(part="1.2", body=b"plain")])
+    message = _selected_adapter(client).fetch_messages([12])[0]
+    assert message.normalized_body == "plain"
+    assert message.attachments[0].filename == "quote.pdf"
+    assert message.attachments[0].media_type == "application/pdf"
+    assert message.attachments[0].part_index == 0
+    assert all("pdf" not in str(fields).lower() for _, fields in client.fetch_calls)
+
+
+def test_html_charset_replacement_and_body_limit_are_safe():
+    structure = {"type": "text", "subtype": "html", "part": "2", "size": 999}
+    client = FakeClient(fetch_responses=[_top_response(structure=structure), _body_response(part="2", mime=b"Content-Type: text/html; charset=unknown\r\n", body=b"<p>A &amp; B</p><script>secret</script><style>x</style>extra", length=17)])
+    message = _selected_adapter(client, max_body_bytes=16).fetch_messages([12])[0]
+    assert message.normalized_body is not None
+    assert "secret" not in message.normalized_body
+    assert "A & B" in message.normalized_body
+    assert message.body_size_bytes == 16
+    assert message.content_truncated is True
+
+
+def test_absent_message_id_and_no_text_part_are_normalized_without_body_fetch():
+    structure = {"type": "application", "subtype": "pdf", "filename": "only.pdf", "size": 4, "disposition": "attachment"}
+    headers = _headers().replace(b"Message-ID: <message@example.test>\r\n", b"")
+    client = FakeClient(fetch_responses=[_top_response(structure=structure, headers=headers)])
+    message = _selected_adapter(client).fetch_messages([12])[0]
+    assert message.normalized_message_id is None
+    assert message.normalized_body is None
+    assert message.body_size_bytes == 0
+    assert len(client.fetch_calls) == 1
+
+
+def test_malformed_message_or_bodystructure_is_safe_and_has_no_raw_cause():
+    client = FakeClient(fetch_responses=[_top_response(structure={"type": "multipart", "parts": "bad"})])
+    with pytest.raises(Exception) as error:
+        _selected_adapter(client).fetch_messages([12])
+    assert "BODYSTRUCTURE" not in str(error.value)
+    assert error.value.__cause__ is None

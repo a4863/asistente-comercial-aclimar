@@ -1,5 +1,10 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
+from email import policy
+from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
+import re
 from typing import Callable
 
 from app.config import IMAPSettings
@@ -111,12 +116,126 @@ def _is_authentication_error(error: Exception) -> bool:
     return "auth" in name or "login" in name
 
 
+def _response_value(response, field: str):
+    if not isinstance(response, dict):
+        return None
+    return response.get(field, response.get(field.encode("ascii")))
+
+
+def _as_bytes(value) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    raise ValueError("not bytes")
+
+
+def _optional_text(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalise_text(value: str) -> str | None:
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[ \t]+\n", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    value = re.sub(r"[ \t]{2,}", " ", value).strip()
+    return value or None
+
+
+class _HTMLToText(HTMLParser):
+    _BLOCK_ELEMENTS = {"address", "article", "br", "div", "li", "p", "section", "table", "tr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._ignored_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+        elif tag in self._BLOCK_ELEMENTS:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in {"script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
+        elif tag in self._BLOCK_ELEMENTS:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._ignored_depth:
+            self._parts.append(data)
+
+    def text(self) -> str | None:
+        return _normalise_text("".join(self._parts))
+
+
+def _html_to_text(value: str) -> str | None:
+    parser = _HTMLToText()
+    parser.feed(value)
+    parser.close()
+    return parser.text()
+
+
+def _walk_bodystructure(structure, path: str = "", attachments: list[AttachmentMetadata] | None = None):
+    """Return text candidates and metadata from the safe bodystructure summary only."""
+    if attachments is None:
+        attachments = []
+    if not isinstance(structure, dict):
+        raise ValueError("invalid bodystructure")
+    media_type = _optional_text(structure.get("type"))
+    subtype = _optional_text(structure.get("subtype"))
+    if not media_type:
+        raise ValueError("missing body type")
+    media_type = media_type.lower()
+    subtype = (subtype or "").lower()
+    children = structure.get("parts")
+    if media_type == "multipart":
+        if not isinstance(children, (list, tuple)):
+            raise ValueError("invalid multipart")
+        candidates = []
+        for index, child in enumerate(children, 1):
+            child_path = f"{path}.{index}" if path else str(index)
+            candidates.extend(_walk_bodystructure(child, child_path, attachments))
+        return candidates
+    if children is not None:
+        raise ValueError("invalid leaf bodystructure")
+    part = _optional_text(structure.get("part")) or path
+    declared_size = _positive_int(structure.get("size")) or 0
+    disposition = _optional_text(structure.get("disposition"))
+    filename = _optional_text(structure.get("filename"))
+    content_id = _optional_text(structure.get("content_id"))
+    content_type = f"{media_type}/{subtype}" if subtype else media_type
+    if media_type == "text" and subtype in {"plain", "html"} and disposition != "attachment":
+        if not part:
+            raise ValueError("missing part")
+        return [{"part": part, "subtype": subtype, "size": declared_size}]
+    if disposition == "attachment" or filename or media_type != "text":
+        attachments.append(
+            AttachmentMetadata(
+                part_index=len(attachments),
+                filename=filename,
+                media_type=content_type,
+                byte_size=declared_size or None,
+                content_id=content_id,
+                disposition=disposition,
+            )
+        )
+    return []
+
+
 class ReadOnlyIMAPAdapter:
     def __init__(self, settings: IMAPSettings, credential_store: CredentialStore, client_factory: Callable = _default_client_factory):
         self._settings = settings
         self._credential_store = credential_store
         self._client_factory = client_factory
         self._client = None
+        self._selected_mailbox: SelectedMailbox | None = None
 
     def connect(self) -> None:
         try:
@@ -146,6 +265,7 @@ class ReadOnlyIMAPAdapter:
 
     def disconnect(self) -> None:
         client, self._client = self._client, None
+        self._selected_mailbox = None
         if client is not None:
             try:
                 client.logout()
@@ -163,6 +283,12 @@ class ReadOnlyIMAPAdapter:
         if self._client is None:
             raise IMAPConnectionError("IMAP adapter is not connected")
         return self._client
+
+    def _require_selected_client(self):
+        client = self._require_client()
+        if self._selected_mailbox is None:
+            raise IMAPProtocolError("IMAP mailbox is not selected")
+        return client
 
     def list_folders(self) -> tuple[MailboxFolder, ...]:
         try:
@@ -193,4 +319,115 @@ class ReadOnlyIMAPAdapter:
             normalized_capabilities = _safe_tuple(capabilities() if callable(capabilities) else capabilities)
         except Exception as error:
             raise IMAPProtocolError("IMAP capability lookup failed") from None
-        return SelectedMailbox(folder_name, uidvalidity, normalized_capabilities)
+        selected = SelectedMailbox(folder_name, uidvalidity, normalized_capabilities)
+        self._selected_mailbox = selected
+        return selected
+
+    def search_uids(self, since: date | None = None) -> tuple[int, ...]:
+        client = self._require_selected_client()
+        criteria = ["ALL"] if since is None else ["SINCE", since]
+        try:
+            raw_uids = client.search(criteria)
+        except Exception:
+            raise IMAPProtocolError("IMAP UID search failed") from None
+        if not isinstance(raw_uids, (list, tuple)):
+            raise IMAPProtocolError("IMAP search returned invalid UIDs")
+        uids = tuple(_positive_int(uid) for uid in raw_uids)
+        if any(uid is None for uid in uids):
+            raise IMAPProtocolError("IMAP search returned invalid UIDs")
+        return tuple(uid for uid in uids if uid is not None)
+
+    def _parse_headers(self, raw_headers: bytes):
+        try:
+            headers = BytesParser(policy=policy.default).parsebytes(raw_headers)
+            def addresses(name):
+                value = headers.get(name)
+                structured = getattr(value, "addresses", ())
+                return tuple(address.addr_spec for address in structured if address.addr_spec)
+
+            sender = addresses("From")
+            recipients = tuple(address for name in ("To", "Cc", "Bcc") for address in addresses(name))
+            sent_at = None
+            raw_date = headers.get("Date")
+            if raw_date:
+                try:
+                    sent_at = parsedate_to_datetime(str(raw_date))
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    sent_at = None
+            return {
+                "normalized_message_id": _optional_text(headers.get("Message-ID")),
+                "sender_address": sender[0] if sender else None,
+                "recipient_addresses": recipients,
+                "subject": _optional_text(headers.get("Subject")),
+                "sent_at": sent_at,
+                "in_reply_to": _optional_text(headers.get("In-Reply-To")),
+                "references_header": _optional_text(headers.get("References")),
+            }
+        except Exception:
+            raise IMAPMessageParseError("IMAP message headers could not be parsed") from None
+
+    def _fetch_selected_part(self, client, uid: int, candidate: dict):
+        limit = self._settings.max_body_bytes
+        part = candidate["part"]
+        fields = [f"BODY.PEEK[{part}.MIME]", f"BODY.PEEK[{part}]<0.{limit + 1}>"]
+        try:
+            response = client.fetch([uid], fields)
+            item = response.get(uid) if isinstance(response, dict) else None
+            mime_headers = _response_value(item, fields[0])
+            payload = _response_value(item, fields[1])
+            raw_mime_headers = _as_bytes(mime_headers) if mime_headers is not None else b""
+            raw_payload = _as_bytes(payload)
+            retained = raw_payload[:limit]
+            parsed = BytesParser(policy=policy.default).parsebytes(raw_mime_headers + b"\r\n" + retained)
+            decoded = parsed.get_payload(decode=True)
+            if decoded is None:
+                decoded = retained
+            charset = parsed.get_content_charset() or "utf-8"
+            try:
+                body = decoded.decode(charset)
+            except (LookupError, UnicodeDecodeError):
+                body = decoded.decode("utf-8", errors="replace")
+        except IMAPAdapterError:
+            raise
+        except Exception:
+            raise IMAPMessageParseError("IMAP message body could not be parsed") from None
+        body = body if candidate["subtype"] == "plain" else _html_to_text(body)
+        return _normalise_text(body or ""), min(len(raw_payload), limit), len(raw_payload) > limit or candidate["size"] > limit
+
+    def fetch_messages(self, uids) -> tuple[FetchedMessage, ...]:
+        client = self._require_selected_client()
+        if isinstance(uids, (str, bytes)) or not isinstance(uids, (list, tuple)):
+            raise IMAPProtocolError("IMAP UIDs are invalid")
+        normalized_uids = tuple(_positive_int(uid) for uid in uids)
+        if any(uid is None for uid in normalized_uids):
+            raise IMAPProtocolError("IMAP UIDs are invalid")
+        normalized_uids = tuple(uid for uid in normalized_uids if uid is not None)
+        if not normalized_uids:
+            return ()
+        try:
+            response = client.fetch(list(normalized_uids), ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"])
+        except Exception:
+            raise IMAPProtocolError("IMAP message retrieval failed") from None
+        if not isinstance(response, dict):
+            raise IMAPProtocolError("IMAP message retrieval returned invalid data")
+        messages = []
+        for uid in normalized_uids:
+            item = response.get(uid)
+            if not isinstance(item, dict):
+                raise IMAPMessageParseError("IMAP message could not be parsed")
+            try:
+                headers = self._parse_headers(_as_bytes(_response_value(item, "BODY.PEEK[HEADER]")))
+                attachments: list[AttachmentMetadata] = []
+                candidates = _walk_bodystructure(_response_value(item, "BODYSTRUCTURE"), attachments=attachments)
+                candidate = next((value for value in candidates if value["subtype"] == "plain"), None)
+                candidate = candidate or next((value for value in candidates if value["subtype"] == "html"), None)
+                if candidate is None:
+                    body, body_size, truncated = None, 0, False
+                else:
+                    body, body_size, truncated = self._fetch_selected_part(client, uid, candidate)
+                messages.append(FetchedMessage(uid=uid, normalized_body=body, body_size_bytes=body_size, content_truncated=truncated, attachments=tuple(attachments), **headers))
+            except IMAPAdapterError:
+                raise
+            except Exception:
+                raise IMAPMessageParseError("IMAP message could not be parsed") from None
+        return tuple(messages)
