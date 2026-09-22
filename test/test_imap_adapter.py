@@ -184,11 +184,19 @@ def _headers(**overrides):
 
 
 def _top_response(uid=12, structure=None, headers=None):
-    return {uid: {b"BODY.PEEK[HEADER]": headers or _headers(), b"BODYSTRUCTURE": structure or {"type": "text", "subtype": "plain", "part": "1", "size": 5}}}
+    return {uid: {b"BODY.PEEK[HEADER]": headers or _headers(), b"BODYSTRUCTURE": structure or _single_part(b"text", b"plain", 5)}}
 
 
 def _body_response(uid=12, part="1", mime=b"Content-Type: text/plain; charset=utf-8\r\n", body=b"hello", length=65):
     return {uid: {f"BODY.PEEK[{part}.MIME]".encode(): mime, f"BODY.PEEK[{part}]<0.{length}>".encode(): body}}
+
+
+def _single_part(major, subtype, octets, parameters=None, content_id=None, disposition=None):
+    return (major, subtype, parameters, content_id, None, b"7BIT", octets, None, disposition, None, None)
+
+
+def _multipart(parts, subtype=b"mixed", parameters=None, disposition=None):
+    return (parts, subtype, parameters, disposition, None, None)
 
 
 def test_uid_search_requires_selected_mailbox_and_uses_all_or_since():
@@ -232,15 +240,13 @@ def test_fetch_is_selective_and_normalizes_headers_and_plain_body():
 
 
 def test_fetch_prefers_plain_extracts_nested_attachment_metadata_and_never_fetches_attachment():
-    structure = {
-        "type": "multipart", "subtype": "mixed", "parts": [
-            {"type": "multipart", "subtype": "alternative", "parts": [
-                {"type": "text", "subtype": "html", "size": 30},
-                {"type": "text", "subtype": "plain", "size": 5},
-            ]},
-            {"type": "application", "subtype": "pdf", "filename": "quote.pdf", "size": 99, "disposition": "attachment", "content_id": "cid-1"},
-        ],
-    }
+    structure = _multipart([
+        _multipart([
+            _single_part(b"text", b"html", 30),
+            _single_part(b"text", b"plain", 5),
+        ], subtype=b"alternative"),
+        _single_part(b"application", b"pdf", 99, parameters=(b"name", b"quote.pdf"), content_id=b"cid-1", disposition=(b"attachment", (b"filename", b"quote.pdf"))),
+    ])
     client = FakeClient(fetch_responses=[_top_response(structure=structure), _body_response(part="1.2", body=b"plain")])
     message = _selected_adapter(client).fetch_messages([12])[0]
     assert message.normalized_body == "plain"
@@ -251,8 +257,8 @@ def test_fetch_prefers_plain_extracts_nested_attachment_metadata_and_never_fetch
 
 
 def test_html_charset_replacement_and_body_limit_are_safe():
-    structure = {"type": "text", "subtype": "html", "part": "2", "size": 999}
-    client = FakeClient(fetch_responses=[_top_response(structure=structure), _body_response(part="2", mime=b"Content-Type: text/html; charset=unknown\r\n", body=b"<p>A &amp; B</p><script>secret</script><style>x</style>extra", length=17)])
+    structure = _single_part(b"text", b"html", 999)
+    client = FakeClient(fetch_responses=[_top_response(structure=structure), _body_response(part="1", mime=b"Content-Type: text/html; charset=unknown\r\n", body=b"<p>A &amp; B</p><script>secret</script><style>x</style>extra", length=17)])
     message = _selected_adapter(client, max_body_bytes=16).fetch_messages([12])[0]
     assert message.normalized_body is not None
     assert "secret" not in message.normalized_body
@@ -262,7 +268,7 @@ def test_html_charset_replacement_and_body_limit_are_safe():
 
 
 def test_absent_message_id_and_no_text_part_are_normalized_without_body_fetch():
-    structure = {"type": "application", "subtype": "pdf", "filename": "only.pdf", "size": 4, "disposition": "attachment"}
+    structure = _single_part(b"application", b"pdf", 4, parameters=(b"name", b"only.pdf"), disposition=(b"attachment", (b"filename", b"only.pdf")))
     headers = _headers().replace(b"Message-ID: <message@example.test>\r\n", b"")
     client = FakeClient(fetch_responses=[_top_response(structure=structure, headers=headers)])
     message = _selected_adapter(client).fetch_messages([12])[0]
@@ -273,7 +279,7 @@ def test_absent_message_id_and_no_text_part_are_normalized_without_body_fetch():
 
 
 def test_malformed_message_or_bodystructure_is_safe_and_has_no_raw_cause():
-    client = FakeClient(fetch_responses=[_top_response(structure={"type": "multipart", "parts": "bad"})])
+    client = FakeClient(fetch_responses=[_top_response(structure=([_single_part(b"text", b"plain", 1)],))])
     with pytest.raises(Exception) as error:
         _selected_adapter(client).fetch_messages([12])
     assert "BODYSTRUCTURE" not in str(error.value)

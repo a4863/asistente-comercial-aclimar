@@ -182,46 +182,72 @@ def _html_to_text(value: str) -> str | None:
     return parser.text()
 
 
+def _protocol_text(value) -> str | None:
+    if value is None:
+        return None
+    return _safe_text(value).strip() or None
+
+
+def _body_parameters(value) -> dict[str, str]:
+    if not isinstance(value, (list, tuple)):
+        return {}
+    pairs = value if all(isinstance(item, (list, tuple)) and len(item) == 2 for item in value) else zip(value[::2], value[1::2])
+    return {
+        key_text.lower(): value_text
+        for key, parameter_value in pairs
+        if (key_text := _protocol_text(key)) and (value_text := _protocol_text(parameter_value))
+    }
+
+
+def _body_disposition(value) -> tuple[str | None, dict[str, str]]:
+    if not isinstance(value, (list, tuple)) or not value:
+        return None, {}
+    return _protocol_text(value[0]), _body_parameters(value[1] if len(value) > 1 else None)
+
+
+def _declared_octets(value) -> int | None:
+    try:
+        octets = int(value)
+    except (TypeError, ValueError):
+        return None
+    return octets if octets >= 0 else None
+
+
 def _walk_bodystructure(structure, path: str = "", attachments: list[AttachmentMetadata] | None = None):
-    """Return text candidates and metadata from the safe bodystructure summary only."""
+    """Traverse IMAPClient BodyData tuples without retaining protocol data."""
     if attachments is None:
         attachments = []
-    if not isinstance(structure, dict):
+    if not isinstance(structure, (list, tuple)) or not structure:
         raise ValueError("invalid bodystructure")
-    media_type = _optional_text(structure.get("type"))
-    subtype = _optional_text(structure.get("subtype"))
-    if not media_type:
-        raise ValueError("missing body type")
-    media_type = media_type.lower()
-    subtype = (subtype or "").lower()
-    children = structure.get("parts")
-    if media_type == "multipart":
-        if not isinstance(children, (list, tuple)):
-            raise ValueError("invalid multipart")
+    if isinstance(structure[0], list):
         candidates = []
-        for index, child in enumerate(children, 1):
+        for index, child in enumerate(structure[0], 1):
             child_path = f"{path}.{index}" if path else str(index)
             candidates.extend(_walk_bodystructure(child, child_path, attachments))
         return candidates
-    if children is not None:
-        raise ValueError("invalid leaf bodystructure")
-    part = _optional_text(structure.get("part")) or path
-    declared_size = _positive_int(structure.get("size")) or 0
-    disposition = _optional_text(structure.get("disposition"))
-    filename = _optional_text(structure.get("filename"))
-    content_id = _optional_text(structure.get("content_id"))
-    content_type = f"{media_type}/{subtype}" if subtype else media_type
+    if len(structure) < 7:
+        raise ValueError("incomplete bodystructure")
+    media_type = _protocol_text(structure[0])
+    subtype = _protocol_text(structure[1])
+    if not media_type or not subtype:
+        raise ValueError("missing body type")
+    media_type, subtype = media_type.lower(), subtype.lower()
+    parameters = _body_parameters(structure[2])
+    content_id = _protocol_text(structure[3])
+    declared_size = _declared_octets(structure[6])
+    disposition, disposition_parameters = _body_disposition(structure[8] if len(structure) > 8 else None)
+    disposition = disposition.lower() if disposition else None
+    filename = disposition_parameters.get("filename") or parameters.get("name")
+    content_type = f"{media_type}/{subtype}"
     if media_type == "text" and subtype in {"plain", "html"} and disposition != "attachment":
-        if not part:
-            raise ValueError("missing part")
-        return [{"part": part, "subtype": subtype, "size": declared_size}]
+        return [{"part": path or "1", "subtype": subtype, "size": declared_size or 0}]
     if disposition == "attachment" or filename or media_type != "text":
         attachments.append(
             AttachmentMetadata(
                 part_index=len(attachments),
                 filename=filename,
                 media_type=content_type,
-                byte_size=declared_size or None,
+                byte_size=declared_size,
                 content_id=content_id,
                 disposition=disposition,
             )
