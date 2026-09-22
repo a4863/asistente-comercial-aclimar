@@ -214,6 +214,13 @@ def test_uid_search_requires_selected_mailbox_and_uses_all_or_since():
     assert client.search_calls == [["ALL"], ["SINCE", date(2024, 1, 2)]]
 
 
+def test_fetch_accepts_generic_uid_iterable():
+    client = FakeClient(fetch_responses=[_top_response(), _body_response()])
+    adapter = _selected_adapter(client)
+    messages = adapter.fetch_messages(uid for uid in [12])
+    assert tuple(message.uid for message in messages) == (12,)
+
+
 def test_invalid_server_or_requested_uids_are_safe_and_do_not_fetch():
     client = FakeClient(search_result=[12, "bad"])
     adapter = _selected_adapter(client)
