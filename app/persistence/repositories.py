@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+from hashlib import sha256
+import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -15,6 +17,8 @@ from app.persistence.models import (
     CRMReference,
     Conversation,
     ConversationMembership,
+    EmailAttachmentMetadata,
+    EmailMessage,
     ExtractedFact,
     FactSourceEvidence,
     ExecutionResult,
@@ -23,6 +27,7 @@ from app.persistence.models import (
     IdempotencyIdentity,
     IdentityLink,
     IdentityLinkCorrection,
+    IMAPMessageLocation,
     Inference,
     InferenceSupport,
     ManualNote,
@@ -806,3 +811,215 @@ class ActionRepository:
         self.session.add(result)
         self.audit.append(event_type="action_proposal_execution_recorded", affected_record_type="action_proposal", affected_record_id=proposal.id, actor_or_source="repository", provenance=provenance, outcome_reference=outcome, failure_code=failure_code)
         return result
+
+
+_EMAIL_FIELDS = frozenset({
+    "normalized_message_id", "sender_address", "recipient_addresses", "subject",
+    "sent_at", "received_at", "in_reply_to", "references_header",
+    "normalized_body", "body_size_bytes", "content_truncated", "provenance",
+})
+_ATTACHMENT_FIELDS = frozenset({
+    "filename", "media_type", "byte_size", "content_id", "disposition", "provenance",
+})
+_OBSERVATION_EVENTS = frozenset({"ingested", "updated", "moved", "unavailable", "reactivated", "reconciled"})
+_CHECKPOINT_RE = re.compile(r"v1:([1-9][0-9]*):(0|[1-9][0-9]*)\Z", re.ASCII)
+_HEX_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+
+
+def _imap_digest(*components: object) -> str:
+    digest = sha256()
+    for component in components:
+        encoded = str(component).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+class IMAPSyncRepository:
+    """Session-scoped, non-committing persistence for read-only IMAP ingestion."""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    @staticmethod
+    def location_key(account_scope: str, folder_name: str, uidvalidity: int, uid: int) -> str:
+        if not account_scope or not folder_name or not isinstance(uidvalidity, int) or uidvalidity <= 0 or not isinstance(uid, int) or uid <= 0:
+            raise ValueError("invalid IMAP location identity")
+        return _imap_digest(account_scope, folder_name, uidvalidity, uid)
+
+    @staticmethod
+    def checkpoint_scope(account_scope: str, folder_name: str) -> str:
+        if not account_scope or not folder_name:
+            raise ValueError("invalid IMAP checkpoint scope")
+        return "imap-folder:v1:" + _imap_digest(account_scope, folder_name)
+
+    def find_location(self, account_scope: str, folder_name: str, uidvalidity: int, uid: int):
+        self.location_key(account_scope, folder_name, uidvalidity, uid)
+        location = self.session.scalar(select(IMAPMessageLocation).where(
+            IMAPMessageLocation.account_scope == account_scope,
+            IMAPMessageLocation.folder_name == folder_name,
+            IMAPMessageLocation.uidvalidity == uidvalidity,
+            IMAPMessageLocation.uid == uid,
+        ))
+        if location is None:
+            return None
+        email = self.session.get(EmailMessage, location.email_message_id)
+        source = self.session.get(SourceRecord, email.source_record_id)
+        return location, email, source
+
+    def find_message_id_candidates(self, account_scope: str, normalized_message_id: str):
+        if not normalized_message_id or not normalized_message_id.strip():
+            return ()
+        return tuple(self.session.scalars(
+            select(EmailMessage).join(SourceRecord, EmailMessage.source_record_id == SourceRecord.id).where(
+                SourceRecord.source_system_scope == account_scope,
+                SourceRecord.source_type == "email_message",
+                EmailMessage.normalized_message_id == normalized_message_id,
+            ).order_by(EmailMessage.id)
+        ))
+
+    def create_independent_occurrence(self, account_scope: str, folder_name: str, uidvalidity: int, uid: int, observed_at: datetime, email_values: dict, provenance: str = "imap_sync"):
+        key = self.location_key(account_scope, folder_name, uidvalidity, uid)
+        if self.find_location(account_scope, folder_name, uidvalidity, uid) is not None:
+            raise ValueError("IMAP location already exists")
+        if not set(email_values) <= _EMAIL_FIELDS or "provenance" in email_values or any(isinstance(value, (bytes, bytearray, memoryview)) for value in email_values.values()):
+            raise ValueError("unsupported email field")
+        source = SourceRecord(source_type="email_message", source_system_scope=account_scope, stable_external_id="imap-occ:v1:" + key, manual_entry=False, provenance=provenance)
+        self.session.add(source)
+        self.session.flush()
+        email = EmailMessage(source_record_id=source.id, provenance=provenance, **email_values)
+        self.session.add(email)
+        self.session.flush()
+        location = self.link_location(email, account_scope, folder_name, uidvalidity, uid, observed_at, provenance)
+        return source, email, location
+
+    def link_location(self, email: EmailMessage, account_scope: str, folder_name: str, uidvalidity: int, uid: int, observed_at: datetime, provenance: str = "imap_sync"):
+        self.location_key(account_scope, folder_name, uidvalidity, uid)
+        source = self.session.get(SourceRecord, email.source_record_id)
+        if source is None or source.source_system_scope != account_scope or source.source_type != "email_message":
+            raise ValueError("IMAP email account scope mismatch")
+        existing = self.find_location(account_scope, folder_name, uidvalidity, uid)
+        if existing is not None:
+            if existing[1].id != email.id:
+                raise ValueError("IMAP location belongs to another email")
+            return existing[0]
+        location = IMAPMessageLocation(email_message_id=email.id, account_scope=account_scope, folder_name=folder_name, uidvalidity=uidvalidity, uid=uid, location_state="active", last_observed_at=observed_at, provenance=provenance)
+        self.session.add(location)
+        return location
+
+    def reserve_occurrence_identity(self, source: SourceRecord, account_scope: str, folder_name: str, uidvalidity: int, uid: int):
+        key = self.location_key(account_scope, folder_name, uidvalidity, uid)
+        if source.source_system_scope != account_scope or source.source_type != "email_message":
+            raise ValueError("IMAP occurrence account scope mismatch")
+        scope = "imap-account:v1:" + _imap_digest(account_scope)
+        identity_key = "v1:" + key
+        identity = self.session.scalar(select(IdempotencyIdentity).where(
+            IdempotencyIdentity.operation_kind == "imap_occurrence",
+            IdempotencyIdentity.scope == scope,
+            IdempotencyIdentity.identity_key == identity_key,
+        ))
+        if identity is not None:
+            if identity.source_record_id != source.id:
+                raise ValueError("IMAP occurrence identity disagrees with source")
+            return identity
+        identity = IdempotencyIdentity(operation_kind="imap_occurrence", scope=scope, identity_key=identity_key, source_record_id=source.id)
+        self.session.add(identity)
+        return identity
+
+    def set_location_state(self, location: IMAPMessageLocation, state: str, observed_at: datetime) -> bool:
+        if state not in {"active", "unavailable"}:
+            raise ValueError("invalid IMAP location state")
+        changed = location.location_state != state
+        location.location_state = state
+        location.last_observed_at = observed_at
+        return changed
+
+    def update_email(self, email: EmailMessage, values: dict) -> bool:
+        if not set(values) <= _EMAIL_FIELDS or any(isinstance(value, (bytes, bytearray, memoryview)) for value in values.values()):
+            raise ValueError("unsupported email field")
+        changed = False
+        for field, value in values.items():
+            if getattr(email, field) != value:
+                setattr(email, field, value)
+                changed = True
+        return changed
+
+    def replace_attachments(self, email: EmailMessage, attachments: list[dict]) -> bool:
+        desired = {}
+        for item in attachments:
+            if set(item) - (_ATTACHMENT_FIELDS | {"part_index"}) or "part_index" not in item or not isinstance(item["part_index"], int) or item["part_index"] < 0 or any(isinstance(value, (bytes, bytearray, memoryview)) for value in item.values()):
+                raise ValueError("invalid attachment metadata")
+            if item["part_index"] in desired:
+                raise ValueError("duplicate attachment part")
+            desired[item["part_index"]] = {field: item.get(field) for field in _ATTACHMENT_FIELDS}
+        existing = {part.part_index: part for part in self.session.scalars(select(EmailAttachmentMetadata).where(EmailAttachmentMetadata.email_message_id == email.id))}
+        changed = False
+        for index, part in existing.items():
+            if index not in desired:
+                self.session.delete(part)
+                changed = True
+        for index, values in desired.items():
+            part = existing.get(index)
+            if part is None:
+                if not values["provenance"]:
+                    raise ValueError("attachment provenance is required")
+                self.session.add(EmailAttachmentMetadata(email_message_id=email.id, part_index=index, **values))
+                changed = True
+            else:
+                for field, value in values.items():
+                    if field == "provenance" and value is None:
+                        continue
+                    if getattr(part, field) != value:
+                        setattr(part, field, value)
+                        changed = True
+        return changed
+
+    def append_observation(self, source: SourceRecord, location: IMAPMessageLocation, event_kind: str, content_digest: str, observed_at: datetime):
+        if event_kind not in _OBSERVATION_EVENTS or not _HEX_DIGEST_RE.fullmatch(content_digest):
+            raise ValueError("invalid IMAP observation metadata")
+        key = self.location_key(location.account_scope, location.folder_name, location.uidvalidity, location.uid)
+        prefix = f"imap:v1:{key}:{event_kind}:"
+        prior = tuple(self.session.scalars(select(SourceObservation).where(
+            SourceObservation.source_record_id == source.id,
+            SourceObservation.source_version_marker.startswith(prefix),
+        ).order_by(SourceObservation.id)))
+        if prior and prior[-1].source_version_marker.endswith(":" + content_digest) and prior[-1].observed_state == location.location_state:
+            return prior[-1], False
+        marker = f"{prefix}{len(prior) + 1}:{content_digest}"
+        observation = SourceObservation(source_record_id=source.id, observed_at=observed_at, source_version_marker=marker, observed_state=location.location_state, outcome=event_kind, provenance="imap_sync")
+        self.session.add(observation)
+        return observation, True
+
+    def append_audit(self, event_type: str, affected_record_type: str, affected_record_id: int, outcome: str, occurred_at: datetime):
+        if event_type not in {"imap_source_ingested", "imap_source_updated", "imap_location_transitioned", "imap_reconciled"} or affected_record_type not in {"source_record", "imap_message_location", "synchronization_checkpoint"} or not isinstance(affected_record_id, int) or affected_record_id <= 0 or outcome not in _OBSERVATION_EVENTS:
+            raise ValueError("invalid IMAP audit metadata")
+        return AuditRepository(self.session).append(event_type=event_type, affected_record_type=affected_record_type, affected_record_id=affected_record_id, actor_or_source="imap_sync", occurred_at=occurred_at, provenance="imap_sync", outcome_reference=outcome)
+
+    def read_folder_checkpoint(self, account_scope: str, folder_name: str):
+        row = SourceRepository(self.session).get_checkpoint(self.checkpoint_scope(account_scope, folder_name))
+        if row is None:
+            return None
+        match = _CHECKPOINT_RE.fullmatch(row.checkpoint_marker or "")
+        if match is None:
+            raise ValueError("invalid IMAP checkpoint marker")
+        return row, int(match.group(1)), int(match.group(2))
+
+    def upsert_folder_checkpoint(self, account_scope: str, folder_name: str, uidvalidity: int, highest_committed_uid: int, last_success_at: datetime, last_outcome: str = "ok"):
+        if not isinstance(uidvalidity, int) or uidvalidity <= 0 or not isinstance(highest_committed_uid, int) or highest_committed_uid < 0 or last_outcome not in {"ok", "degraded"}:
+            raise ValueError("invalid IMAP checkpoint")
+        prior = self.read_folder_checkpoint(account_scope, folder_name)
+        if prior and prior[1] == uidvalidity and highest_committed_uid < prior[2]:
+            raise ValueError("IMAP checkpoint cannot go backwards")
+        marker = f"v1:{uidvalidity}:{highest_committed_uid}"
+        return SourceRepository(self.session).upsert_checkpoint(self.checkpoint_scope(account_scope, folder_name), marker, last_success_at, last_outcome)
+
+    def list_active_locations(self, account_scope: str, folder_name: str, uidvalidity: int):
+        return tuple(self.session.scalars(select(IMAPMessageLocation).where(
+            IMAPMessageLocation.account_scope == account_scope,
+            IMAPMessageLocation.folder_name == folder_name,
+            IMAPMessageLocation.uidvalidity == uidvalidity,
+            IMAPMessageLocation.location_state == "active",
+        ).order_by(IMAPMessageLocation.uid)))
+
+    def list_source_locations(self, source: SourceRecord):
+        return tuple(self.session.scalars(select(IMAPMessageLocation).join(EmailMessage, IMAPMessageLocation.email_message_id == EmailMessage.id).where(EmailMessage.source_record_id == source.id).order_by(IMAPMessageLocation.id)))

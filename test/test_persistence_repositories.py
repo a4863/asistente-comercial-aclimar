@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.persistence.models import (
     Alert,
@@ -10,21 +11,27 @@ from app.persistence.models import (
     Commitment,
     ExecutionResult,
     CRMContextLink,
+    EmailAttachmentMetadata,
+    EmailMessage,
     FactSourceEvidence,
     FollowUpPreferenceHistory,
     IdentityLink,
     IdentityLinkCorrection,
+    IMAPMessageLocation,
+    IdempotencyIdentity,
     InferenceSupport,
     OperationalEvidenceLink,
     ProposalSupport,
     SourceObservation,
     SourceRecord,
+    SynchronizationCheckpoint,
     Task,
 )
 from app.persistence.repositories import (
     ActionRepository,
     AuditRepository,
     DerivationRepository,
+    IMAPSyncRepository,
     OperationalRepository,
     ProvenanceRepository,
     SourceRepository,
@@ -42,6 +49,173 @@ def _source(db_session, external_id=None):
     db_session.add(source)
     db_session.flush()
     return source
+
+
+def _imap_occurrence(db_session, *, folder="INBOX", uid=7, message_id="<one@example.test>"):
+    repository = IMAPSyncRepository(db_session)
+    when = datetime(2026, 9, 22, tzinfo=timezone.utc)
+    source, email, location = repository.create_independent_occurrence(
+        "imap:account", folder, 42, uid, when,
+        {"normalized_message_id": message_id, "subject": "Synthetic", "body_size_bytes": 4, "normalized_body": "body", "content_truncated": False},
+    )
+    db_session.flush()
+    return repository, source, email, location, when
+
+
+def test_imap_exact_location_candidates_and_independent_duplicate(db_session):
+    repo, source, email, location, when = _imap_occurrence(db_session)
+    assert repo.find_location("imap:account", "INBOX", 42, 7) == (location, email, source)
+    assert repo.find_location("imap:account", "INBOX", 42, 8) is None
+    assert source.stable_external_id == "imap-occ:v1:" + repo.location_key("imap:account", "INBOX", 42, 7)
+    assert source.source_type == "email_message"
+    assert repo.find_message_id_candidates("imap:account", "<one@example.test>") == (email,)
+    assert repo.find_message_id_candidates("imap:account", "") == ()
+    second_source, second_email, _ = repo.create_independent_occurrence(
+        "imap:account", "Sent", 42, 9, when,
+        {"normalized_message_id": "<one@example.test>"},
+    )
+    db_session.flush()
+    assert second_source.id != source.id
+    assert repo.find_message_id_candidates("imap:account", "<one@example.test>") == (email, second_email)
+    assert repo.find_message_id_candidates("other-account", "<one@example.test>") == ()
+    _, missing_email, _ = repo.create_independent_occurrence("imap:account", "INBOX", 42, 10, when, {})
+    db_session.flush()
+    assert missing_email.normalized_message_id is None
+    assert repo.find_message_id_candidates("imap:account", " ") == ()
+    linked = repo.link_location(email, "imap:account", "Sent", 42, 11, when)
+    db_session.flush()
+    assert linked.email_message_id == email.id
+    assert repo.link_location(email, "imap:account", "Sent", 42, 11, when) is linked
+    assert repo.list_source_locations(source) == (location, linked)
+    assert repo.list_active_locations("imap:account", "INBOX", 42) == (location, repo.find_location("imap:account", "INBOX", 42, 10)[0])
+    with pytest.raises(ValueError):
+        repo.link_location(second_email, "imap:account", "INBOX", 42, 7, when)
+    with pytest.raises(ValueError):
+        repo.link_location(email, "other-account", "INBOX", 42, 12, when)
+
+
+def test_imap_idempotency_identity_and_conflict(db_session):
+    repo, source, _, _, _ = _imap_occurrence(db_session)
+    first = repo.reserve_occurrence_identity(source, "imap:account", "INBOX", 42, 7)
+    db_session.flush()
+    assert repo.reserve_occurrence_identity(source, "imap:account", "INBOX", 42, 7) is first
+    assert first.operation_kind == "imap_occurrence"
+    assert first.scope.startswith("imap-account:v1:")
+    assert len(first.scope) == len("imap-account:v1:") + 64
+    assert first.identity_key == "v1:" + repo.location_key("imap:account", "INBOX", 42, 7)
+    assert db_session.query(IdempotencyIdentity).count() == 1
+    other_source, _, _ = repo.create_independent_occurrence("imap:account", "Sent", 42, 8, datetime.now(timezone.utc), {})
+    db_session.flush()
+    with pytest.raises(ValueError):
+        repo.reserve_occurrence_identity(other_source, "imap:account", "INBOX", 42, 7)
+    with pytest.raises(ValueError):
+        repo.reserve_occurrence_identity(source, "other-account", "INBOX", 42, 7)
+
+
+def test_imap_email_updates_and_attachment_metadata_are_idempotent(db_session):
+    repo, _, email, _, _ = _imap_occurrence(db_session)
+    assert repo.update_email(email, {"subject": "Synthetic"}) is False
+    assert repo.update_email(email, {"subject": "Updated", "normalized_body": "new body"}) is True
+    with pytest.raises(ValueError):
+        repo.update_email(email, {"source_record_id": 999})
+    with pytest.raises(ValueError):
+        repo.update_email(email, {"normalized_body": b"raw MIME"})
+    original = [{"part_index": 0, "filename": "quote.pdf", "media_type": "application/pdf", "byte_size": 5, "provenance": "imap_sync"}]
+    assert repo.replace_attachments(email, original) is True
+    db_session.flush()
+    part = db_session.scalar(select(EmailAttachmentMetadata).where(EmailAttachmentMetadata.email_message_id == email.id))
+    assert repo.replace_attachments(email, original) is False
+    assert db_session.scalar(select(EmailAttachmentMetadata).where(EmailAttachmentMetadata.email_message_id == email.id)) is part
+    revised = [{**original[0], "filename": "revised.pdf"}]
+    assert repo.replace_attachments(email, revised) is True
+    assert part.filename == "revised.pdf"
+    assert repo.replace_attachments(email, []) is True
+    db_session.flush()
+    assert db_session.scalar(select(EmailAttachmentMetadata).where(EmailAttachmentMetadata.email_message_id == email.id)) is None
+    with pytest.raises(ValueError):
+        repo.replace_attachments(email, [{**original[0], "payload": b"forbidden"}])
+    with pytest.raises(ValueError):
+        repo.replace_attachments(email, [{**original[0], "filename": b"raw"}])
+
+
+def test_imap_observation_transition_audit_and_checkpoint(db_session):
+    repo, source, _, location, when = _imap_occurrence(db_session)
+    digest = "a" * 64
+    first, created = repo.append_observation(source, location, "ingested", digest, when)
+    assert created is True
+    db_session.flush()
+    repeat, created = repo.append_observation(source, location, "ingested", digest, when)
+    assert (repeat, created) == (first, False)
+    updated, created = repo.append_observation(source, location, "updated", "b" * 64, when)
+    assert created is True
+    db_session.flush()
+    assert updated.source_version_marker != first.source_version_marker
+    assert len(first.source_version_marker) < 255
+    assert repo.set_location_state(location, "unavailable", when) is True
+    unavailable, created = repo.append_observation(source, location, "unavailable", digest, when)
+    assert created is True
+    db_session.flush()
+    assert unavailable.observed_state == "unavailable"
+    assert repo.list_active_locations("imap:account", "INBOX", 42) == ()
+    assert repo.set_location_state(location, "active", when) is True
+    reactivated, created = repo.append_observation(source, location, "reactivated", digest, when)
+    assert created is True
+    assert reactivated.source_version_marker != first.source_version_marker
+    assert location.last_observed_at == when
+    event = repo.append_audit("imap_location_transitioned", "imap_message_location", location.id, "reactivated", when)
+    assert event.outcome_reference == "reactivated"
+    assert event.provenance == "imap_sync"
+    with pytest.raises(ValueError):
+        repo.append_audit("imap_source_updated", "source_record", source.id, "raw body", when)
+    checkpoint = repo.upsert_folder_checkpoint("imap:account", "INBOX", 42, 7, when)
+    db_session.flush()
+    assert checkpoint.source_system_scope == repo.checkpoint_scope("imap:account", "INBOX")
+    assert repo.read_folder_checkpoint("imap:account", "INBOX") == (checkpoint, 42, 7)
+    assert repo.upsert_folder_checkpoint("imap:account", "INBOX", 42, 11, when) is checkpoint
+    with pytest.raises(ValueError):
+        repo.upsert_folder_checkpoint("imap:account", "INBOX", 42, 10, when)
+    assert repo.upsert_folder_checkpoint("imap:account", "INBOX", 43, 0, when) is checkpoint
+    assert repo.read_folder_checkpoint("imap:account", "INBOX") == (checkpoint, 43, 0)
+    checkpoint.checkpoint_marker = "corrupt"
+    with pytest.raises(ValueError):
+        repo.read_folder_checkpoint("imap:account", "INBOX")
+
+
+def test_imap_repository_never_commits_and_caller_rollback_removes_rows(db_session):
+    repo, source, email, location, when = _imap_occurrence(db_session)
+    repo.reserve_occurrence_identity(source, "imap:account", "INBOX", 42, 7)
+    repo.append_observation(source, location, "ingested", "b" * 64, when)
+    repo.upsert_folder_checkpoint("imap:account", "INBOX", 42, 7, when)
+    db_session.flush()
+    db_session.rollback()
+    assert db_session.get(SourceRecord, source.id) is None
+    assert db_session.get(EmailMessage, email.id) is None
+    assert db_session.get(IMAPMessageLocation, location.id) is None
+    assert db_session.query(SynchronizationCheckpoint).count() == 0
+    assert db_session.query(SourceObservation).count() == 0
+
+
+def test_imap_location_unique_conflict_recovers_by_reread(db_session):
+    repo, _, email, location, when = _imap_occurrence(db_session)
+    db_session.commit()
+    duplicate = IMAPMessageLocation(
+        email_message_id=email.id,
+        account_scope="imap:account",
+        folder_name="INBOX",
+        uidvalidity=42,
+        uid=7,
+        location_state="active",
+        last_observed_at=when,
+        provenance="imap_sync",
+    )
+    db_session.add(duplicate)
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+    db_session.rollback()
+    recovered = IMAPSyncRepository(db_session).find_location("imap:account", "INBOX", 42, 7)
+    assert recovered is not None
+    assert recovered[0].id == location.id
+    assert db_session.query(IMAPMessageLocation).count() == 1
 
 
 def test_source_repository_checkpoint_and_idempotency(db_session):
