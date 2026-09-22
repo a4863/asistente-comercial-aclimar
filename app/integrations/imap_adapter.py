@@ -119,7 +119,21 @@ def _is_authentication_error(error: Exception) -> bool:
 def _response_value(response, field: str):
     if not isinstance(response, dict):
         return None
-    return response.get(field, response.get(field.encode("ascii")))
+    requested = _normalise_fetch_key(field)
+    for key, value in response.items():
+        if _normalise_fetch_key(key) == requested:
+            return value
+    return None
+
+
+def _normalise_fetch_key(value) -> str:
+    text = _safe_text(value).upper()
+    match = re.fullmatch(r"BODY(?:\.PEEK)?\[([^\]]+)\](?:<(\d+)(?:\.\d+)?>)?", text)
+    if not match:
+        return text
+    section, offset = match.groups()
+    partial = f"<{offset}>" if offset is not None else ""
+    return f"BODY[{section}]{partial}"
 
 
 def _as_bytes(value) -> bytes:
@@ -235,7 +249,15 @@ def _walk_bodystructure(structure, path: str = "", attachments: list[AttachmentM
     parameters = _body_parameters(structure[2])
     content_id = _protocol_text(structure[3])
     declared_size = _declared_octets(structure[6])
-    disposition, disposition_parameters = _body_disposition(structure[8] if len(structure) > 8 else None)
+    if media_type == "text":
+        disposition_index = 9
+    elif media_type == "message" and subtype == "rfc822":
+        disposition_index = 11
+    else:
+        disposition_index = 8
+    disposition, disposition_parameters = _body_disposition(
+        structure[disposition_index] if len(structure) > disposition_index else None
+    )
     disposition = disposition.lower() if disposition else None
     filename = disposition_parameters.get("filename") or parameters.get("name")
     content_type = f"{media_type}/{subtype}"

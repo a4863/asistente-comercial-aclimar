@@ -184,15 +184,18 @@ def _headers(**overrides):
 
 
 def _top_response(uid=12, structure=None, headers=None):
-    return {uid: {b"BODY.PEEK[HEADER]": headers or _headers(), b"BODYSTRUCTURE": structure or _single_part(b"text", b"plain", 5)}}
+    return {uid: {b"BODY[HEADER]": headers or _headers(), b"BODYSTRUCTURE": structure or _single_part(b"text", b"plain", 5)}}
 
 
 def _body_response(uid=12, part="1", mime=b"Content-Type: text/plain; charset=utf-8\r\n", body=b"hello", length=65):
-    return {uid: {f"BODY.PEEK[{part}.MIME]".encode(): mime, f"BODY.PEEK[{part}]<0.{length}>".encode(): body}}
+    return {uid: {f"BODY[{part}.MIME]".encode(): mime, f"BODY[{part}]<0>".encode(): body}}
 
 
 def _single_part(major, subtype, octets, parameters=None, content_id=None, disposition=None):
-    return (major, subtype, parameters, content_id, None, b"7BIT", octets, None, disposition, None, None)
+    basic = [major, subtype, parameters, content_id, None, b"7BIT", octets]
+    if major == b"text":
+        return tuple(basic + [0, None, disposition, None, None])
+    return tuple(basic + [None, disposition, None, None])
 
 
 def _multipart(parts, subtype=b"mixed", parameters=None, disposition=None):
@@ -276,6 +279,26 @@ def test_absent_message_id_and_no_text_part_are_normalized_without_body_fetch():
     assert message.normalized_body is None
     assert message.body_size_bytes == 0
     assert len(client.fetch_calls) == 1
+
+
+def test_text_attachment_uses_text_specific_disposition_index_and_is_not_fetched():
+    structure = _multipart([
+        _single_part(b"text", b"plain", 20, disposition=(b"attachment", (b"filename", b"notes.txt"))),
+        _single_part(b"text", b"html", 8),
+    ], subtype=b"alternative")
+    client = FakeClient(fetch_responses=[_top_response(structure=structure), _body_response(part="2", mime=b"Content-Type: text/html\r\n", body=b"<p>safe</p>")])
+    message = _selected_adapter(client).fetch_messages([12])[0]
+    assert message.normalized_body == "safe"
+    assert message.attachments[0].filename == "notes.txt"
+    assert message.attachments[0].media_type == "text/plain"
+    assert all("[1]" not in str(fields) for _, fields in client.fetch_calls[1:])
+
+
+def test_whole_message_response_key_is_not_accepted_for_a_requested_part():
+    client = FakeClient(fetch_responses=[_top_response(), {12: {b"BODY[1.MIME]": b"Content-Type: text/plain\r\n", b"BODY[]": b"not selected"}}])
+    with pytest.raises(Exception) as error:
+        _selected_adapter(client).fetch_messages([12])
+    assert error.value.__cause__ is None
 
 
 def test_malformed_message_or_bodystructure_is_safe_and_has_no_raw_cause():
