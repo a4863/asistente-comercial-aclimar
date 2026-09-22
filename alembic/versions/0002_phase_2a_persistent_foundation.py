@@ -334,6 +334,13 @@ def upgrade():
         sa.Column("provenance", sa.String(length=255), nullable=False),
         sa.Column("superseded_at", sa.DateTime(timezone=True), nullable=True),
     )
+    op.create_index(
+        "uq_identity_link_active_confirmed",
+        "identity_link",
+        ["identity_type", "identity_value"],
+        unique=True,
+        sqlite_where=sa.text("status = 'confirmed' AND superseded_at IS NULL"),
+    )
 
     op.create_table(
         "fact_source_evidence",
@@ -426,6 +433,10 @@ def upgrade():
         ),
         sa.Column("corrected_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("provenance", sa.String(length=255), nullable=False),
+        sa.CheckConstraint(
+            "prior_identity_link_id != replacement_identity_link_id",
+            name="ck_identity_link_correction_distinct_links",
+        ),
         sa.UniqueConstraint(
             "prior_identity_link_id",
             name="uq_identity_link_correction_prior",
@@ -435,6 +446,7 @@ def upgrade():
 
 def downgrade():
     op.drop_table("identity_link_correction")
+    op.drop_index("uq_identity_link_active_confirmed", table_name="identity_link")
     op.drop_table("proposal_support")
     op.drop_table("inference_support")
     op.drop_table("fact_source_evidence")
