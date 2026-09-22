@@ -15,7 +15,7 @@ _IMAP_SECRET_KEYS = {
 
 @dataclass(frozen=True)
 class IMAPSettings:
-    host: str = "outlook.office365.com"
+    host: str = "imap.invalid"
     port: int = 993
     account: str = "alexllopez@aclimar.com"
     account_scope: str = "imap:alexllopez@aclimar.com"
