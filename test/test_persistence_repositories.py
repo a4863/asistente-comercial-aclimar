@@ -1,21 +1,31 @@
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import select
 
 from app.persistence.models import (
+    Alert,
+    ApprovalDecision,
     AuditEvent,
+    Commitment,
+    ExecutionResult,
     CRMContextLink,
     FactSourceEvidence,
+    FollowUpPreferenceHistory,
     IdentityLink,
     IdentityLinkCorrection,
     InferenceSupport,
+    OperationalEvidenceLink,
     ProposalSupport,
     SourceObservation,
     SourceRecord,
+    Task,
 )
 from app.persistence.repositories import (
+    ActionRepository,
     AuditRepository,
     DerivationRepository,
+    OperationalRepository,
     ProvenanceRepository,
     SourceRepository,
 )
@@ -294,3 +304,143 @@ def test_audit_repository_rejects_unsafe_or_unknown_fields(db_session):
             provenance="test",
             arbitrary="x",
         )
+
+
+def test_operational_task_lifecycle_and_audit(db_session):
+    repository = OperationalRepository(db_session)
+
+    pending = repository.create_task("pending", "test")
+    completed = repository.create_task("completed", "test")
+    cancelled = repository.create_task("cancelled", "test")
+    pending_cancelled = repository.create_task("pending-cancelled", "test")
+    db_session.flush()
+
+    assert repository.transition_task(pending.id, "pending").state == "pending"
+    assert repository.transition_task(completed.id, "pending").state == "pending"
+    with pytest.raises(ValueError):
+        repository.transition_task(completed.id, "completed")
+    assert repository.transition_task(completed.id, "completed", "confirmed-by-user").completion_reference == "confirmed-by-user"
+    assert repository.transition_task(cancelled.id, "cancelled").state == "cancelled"
+    assert repository.transition_task(pending_cancelled.id, "pending").state == "pending"
+    assert repository.transition_task(pending_cancelled.id, "cancelled").state == "cancelled"
+    with pytest.raises(ValueError):
+        repository.transition_task(cancelled.id, "pending")
+    db_session.flush()
+
+    assert isinstance(db_session.get(Task, completed.id), Task)
+    assert any(event.event_type == "task_transitioned" for event in AuditRepository(db_session).list_for("task", completed.id))
+
+
+def test_commitment_question_and_next_step_lifecycles(db_session):
+    repository = OperationalRepository(db_session)
+    past = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    future = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    overdue = repository.create_commitment("past", "test", due_at=past)
+    future_commitment = repository.create_commitment("future", "test", due_at=future)
+    fulfilled = repository.create_commitment("fulfilled", "test")
+    question = repository.create_question("What is due?", "test")
+    next_step = repository.create_next_step("call", "test")
+    db_session.flush()
+
+    for commitment in (overdue, future_commitment, fulfilled):
+        assert repository.transition_commitment(commitment.id, "confirmed").state == "confirmed"
+    with pytest.raises(ValueError):
+        repository.transition_commitment(fulfilled.id, "fulfilled")
+    assert repository.transition_commitment(fulfilled.id, "fulfilled", "user-confirmed").state == "fulfilled"
+    evaluated = repository.evaluate_overdue(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert evaluated == [overdue]
+    assert overdue.state == "overdue"
+    assert future_commitment.state == "confirmed"
+    assert isinstance(db_session.get(Commitment, overdue.id), Commitment)
+
+    assert repository.transition_question(question.id, "open").state == "open"
+    with pytest.raises(ValueError):
+        repository.transition_question(question.id, "answered")
+    assert repository.transition_question(question.id, "answered", "answer-evidence").answer_reference == "answer-evidence"
+    with pytest.raises(ValueError):
+        repository.transition_question(question.id, "dismissed")
+
+    assert repository.transition_next_step(next_step.id, "planned").state == "planned"
+    with pytest.raises(ValueError):
+        repository.transition_next_step(next_step.id, "completed")
+    assert repository.transition_next_step(next_step.id, "completed", "completed-by-user").completion_reference == "completed-by-user"
+
+
+def test_alerts_and_follow_up_preferences(db_session):
+    repository = OperationalRepository(db_session)
+    active = repository.get_or_create_alert("follow_up", "company", 1, "company:1", "test")
+    db_session.flush()
+    assert repository.get_or_create_alert("follow_up", "company", 1, "company:1", "test") is active
+    assert repository.resolve_alert(active.id).state == "resolved"
+    recurrence = repository.get_or_create_alert("follow_up", "company", 1, "company:1", "test")
+    assert recurrence is not active
+    db_session.flush()
+    with pytest.raises(ValueError):
+        repository.dismiss_alert(recurrence.id, "")
+    assert repository.dismiss_alert(recurrence.id, "alejandro").state == "dismissed"
+    assert isinstance(db_session.get(Alert, recurrence.id), Alert)
+
+    global_preference = repository.set_follow_up_preference("global", None, "sent_offer", inactivity_days=5, provenance="test")
+    company_preference = repository.set_follow_up_preference("company", "crm-company", "sent_offer", inactivity_days=8, provenance="test")
+    opportunity_preference = repository.set_follow_up_preference("opportunity", "crm-opportunity", "sent_offer", inactivity_days=3, provenance="test")
+    repository.set_follow_up_preference("opportunity", "crm-opportunity", "sent_offer", inactivity_days=4, provenance="test")
+    db_session.flush()
+    history = list(db_session.scalars(select(FollowUpPreferenceHistory).where(FollowUpPreferenceHistory.follow_up_preference_id == opportunity_preference.id)))
+    assert len(history) == 2
+    exact = repository.resolve_follow_up_preference("sent_offer", crm_scopes=[("company", "crm-company"), ("opportunity", "crm-opportunity")])
+    assert exact["preference"] is opportunity_preference
+    assert exact["inactivity_days"] == 4
+    crm_over_manual = repository.resolve_follow_up_preference("sent_offer", crm_scopes=[("company", "crm-company")], manual_scope=("opportunity", "manual-opportunity"))
+    assert crm_over_manual["preference"] is company_preference
+    future_date = datetime(2030, 2, 1, tzinfo=timezone.utc)
+    repository.set_follow_up_preference("contact", "crm-contact", "homologation_docs", inactivity_days=7, explicit_future_date=future_date, provenance="test")
+    date_resolution = repository.resolve_follow_up_preference("homologation_docs", crm_scopes=[("contact", "crm-contact")])
+    assert date_resolution["explicit_future_date"].replace(tzinfo=timezone.utc) == future_date
+    assert date_resolution["inactivity_days"] == 7
+    assert repository.resolve_follow_up_preference("new_or_qualified_opportunity")["inactivity_days"] == 7
+    assert repository.resolve_follow_up_preference("negotiation_review")["inactivity_days"] == 5
+    assert global_preference.id is not None
+
+
+def test_action_approval_execution_idempotency_and_audit(db_session):
+    repository = ActionRepository(db_session)
+    proposal = repository.create_action_proposal("move_message", "message", "m-1", "external_action", "mailbox", "m-1:move", "test")
+    db_session.flush()
+    assert repository.create_action_proposal("move_message", "message", "m-1", "external_action", "mailbox", "m-1:move", "test") is proposal
+    with pytest.raises(ValueError):
+        repository.append_execution_result(proposal.id, "executed", "revalidated", "test")
+    approval = repository.decide_action(proposal.id, "approved", "alejandro", "test")
+    db_session.flush()
+    assert isinstance(approval, ApprovalDecision)
+    with pytest.raises(ValueError):
+        repository.decide_action(proposal.id, "approved", "alejandro", "test")
+    with pytest.raises(ValueError):
+        repository.append_execution_result(proposal.id, "executed", "", "test")
+    error = repository.append_execution_result(proposal.id, "error", "still-current", "test", failure_code="temporary")
+    assert isinstance(error, ExecutionResult)
+    assert proposal.state == "error"
+    executed = repository.append_execution_result(proposal.id, "executed", "still-current", "test", external_result_reference="moved")
+    assert executed.outcome == "executed"
+    assert proposal.state == "executed"
+    with pytest.raises(ValueError):
+        repository.append_execution_result(proposal.id, "error", "still-current", "test")
+    rejected = repository.create_action_proposal("create_draft", "message", "m-2", "external_action", "mailbox", "m-2:draft", "test")
+    db_session.flush()
+    assert repository.decide_action(rejected.id, "rejected", "alejandro", "test").decision == "rejected"
+    assert any(event.event_type == "action_proposal_execution_recorded" for event in AuditRepository(db_session).list_for("action_proposal", proposal.id))
+
+
+def test_operational_evidence_validation(db_session):
+    repository = OperationalRepository(db_session)
+    task = repository.create_task("evidence", "test")
+    db_session.flush()
+    confirmation = repository.add_operational_evidence("task", task.id, "user_confirmation", evidence_reference="confirmed-by-user", provenance="test")
+    assert isinstance(confirmation, OperationalEvidenceLink)
+    evidence = repository.add_operational_evidence("task", task.id, "fact", evidence_id=1, provenance="test")
+    assert evidence.evidence_id == 1
+    with pytest.raises(ValueError):
+        repository.add_operational_evidence("fact", task.id, "fact", evidence_id=1)
+    with pytest.raises(ValueError):
+        repository.add_operational_evidence("task", task.id, "user_confirmation", evidence_id=1, evidence_reference="bad")
+    with pytest.raises(ValueError):
+        repository.add_operational_evidence("task", task.id, "source")
