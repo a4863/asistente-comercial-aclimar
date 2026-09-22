@@ -4,8 +4,10 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.persistence.models import (
+    Alert,
     CRMContextLink,
     CRMReference,
+    Commitment,
     Conversation,
     ConversationMembership,
     ExtractedFact,
@@ -14,9 +16,12 @@ from app.persistence.models import (
     IdentityLink,
     IdentityLinkCorrection,
     ManualNote,
+    NextStep,
     Proposal,
     ProposalSupport,
+    Question,
     SourceObservation,
+    Task,
     SourceRecord,
     WhatsAppImport,
 )
@@ -250,3 +255,62 @@ def test_identity_link_correction_rejects_self_reference(db_session):
     )
     with pytest.raises(IntegrityError):
         db_session.flush()
+
+
+
+@pytest.mark.parametrize(
+    ("model", "values"),
+    [
+        (Task, {"title": "t", "state": "invalid", "provenance": "test"}),
+        (Commitment, {"description": "c", "state": "invalid", "provenance": "test"}),
+        (Question, {"question_text": "q", "state": "invalid", "provenance": "test"}),
+        (NextStep, {"description": "n", "state": "invalid", "provenance": "test"}),
+        (
+            Alert,
+            {
+                "alert_type": "followup",
+                "target_type": "crm_reference",
+                "target_id": 1,
+                "condition_key": "k",
+                "state": "invalid",
+                "provenance": "test",
+            },
+        ),
+    ],
+)
+def test_phase2b_core_state_constraints(db_session, model, values):
+    db_session.add(model(**values))
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_alert_deduplicates_only_active_condition(db_session):
+    base = dict(
+        alert_type="followup",
+        target_type="crm_reference",
+        target_id=7,
+        condition_key="stale",
+        provenance="test",
+    )
+    first = Alert(**base, state="active")
+    db_session.add(first)
+    db_session.flush()
+
+    duplicate = Alert(**base, state="active")
+    db_session.add(duplicate)
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_alert_recurrence_allowed_after_resolution(db_session):
+    base = dict(
+        alert_type="followup",
+        target_type="crm_reference",
+        target_id=8,
+        condition_key="stale",
+        provenance="test",
+    )
+    closed = Alert(**base, state="resolved")
+    current = Alert(**base, state="active")
+    db_session.add_all([closed, current])
+    db_session.flush()
