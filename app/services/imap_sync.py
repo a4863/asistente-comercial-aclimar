@@ -1,6 +1,6 @@
 """Read-only IMAP ingestion with durable per-occurrence checkpoints."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 from hashlib import sha256
 import json
@@ -17,6 +17,9 @@ class FolderSyncResult:
     updated: int = 0
     skipped: int = 0
     failure_codes: tuple[str, ...] = ()
+    moved: int = 0
+    unavailable: int = 0
+    reactivated: int = 0
 
 
 @dataclass(frozen=True)
@@ -121,7 +124,11 @@ def _persist(repo, account, folder, uidvalidity, uid, message, observed_at, inve
     if exact:
         location, email, source = exact
         if location.location_state != "active":
-            raise _Failure("reactivation_deferred")
+            # Exact reappearance is evidence, but the state transition waits
+            # for a complete, successful account-wide reconciliation pass.
+            repo.reserve_occurrence_identity(source, account, folder, uidvalidity, uid)
+            repo.upsert_folder_checkpoint(account, folder, uidvalidity, uid, observed_at)
+            return "skipped"
         repo.set_location_state(location, "active", observed_at)
         changed = repo.update_email(email, values)
         changed = repo.replace_attachments(email, parts) or changed
@@ -151,15 +158,114 @@ def _persist(repo, account, folder, uidvalidity, uid, message, observed_at, inve
     return kind
 
 
+def _is_present(location, inventories):
+    snapshot = inventories.get(location.folder_name)
+    return bool(snapshot and location.uidvalidity == snapshot[0] and location.uid in snapshot[1])
+
+
+def _transition(repo, account, identity, target, observed_at, move_identity=None):
+    exact = repo.find_location(account, *identity)
+    if exact is None:
+        raise _Failure("reconciliation_location_missing")
+    location, email, source = exact
+    if location.location_state == target:
+        return False
+    if target == "active" and location.location_state != "unavailable":
+        raise _Failure("reconciliation_state_conflict")
+    if target == "unavailable" and location.location_state != "active":
+        raise _Failure("reconciliation_state_conflict")
+    parts = list(repo.email_attachment_values(email))
+    values = {field: getattr(email, field) for field in _EMAIL_FIELDS}
+    digest = _digest(values, parts)
+    repo.set_location_state(location, target, observed_at)
+    event = "reactivated" if target == "active" else "unavailable"
+    repo.append_observation(source, location, event, digest, observed_at)
+    repo.append_audit("imap_location_transitioned", "imap_message_location", location.id, event, observed_at)
+    if move_identity is not None:
+        destination = repo.find_location(account, *move_identity)
+        if destination is None:
+            raise _Failure("reconciliation_move_conflict")
+        new_location, new_email, new_source = destination
+        if (new_location.id == location.id or new_email.id != email.id
+                or new_source.id != source.id or new_location.location_state != "active"):
+            raise _Failure("reconciliation_move_conflict")
+        repo.append_observation(source, new_location, "moved", digest, observed_at)
+        repo.append_audit("imap_reconciled", "imap_message_location", new_location.id, "moved", observed_at)
+    return True
+
+
+def _identity(location):
+    return location.folder_name, location.uidvalidity, location.uid
+
+
+def _reconcile(account, inventories, session_factory, clock, results):
+    """Transition exact reappearances, then moves, then unmatched absence."""
+    by_folder = {result.folder: index for index, result in enumerate(results)}
+    try:
+        locations = _transaction(session_factory, lambda repo: repo.list_account_locations(account))
+    except Exception:
+        return results, ("reconciliation_read_failed",)
+    # An absent folder has no complete inventory; retain its historical state.
+    reappearances = [row for row in locations if row[0].folder_name in inventories
+                     and row[0].location_state == "unavailable" and _is_present(row[0], inventories)]
+    for location, _, _ in reappearances:
+        folder = location.folder_name
+        try:
+            changed = _transaction(session_factory, lambda repo: _transition(
+                repo, account, _identity(location), "active", _now(clock)
+            ))
+            if changed:
+                results[by_folder[folder]] = replace(results[by_folder[folder]], reactivated=results[by_folder[folder]].reactivated + 1)
+        except Exception:
+            result = results[by_folder[folder]]
+            results[by_folder[folder]] = replace(result, failure_codes=result.failure_codes + ("reconciliation_failed",))
+            return results, ()
+    try:
+        locations = _transaction(session_factory, lambda repo: repo.list_account_locations(account))
+    except Exception:
+        return results, ("reconciliation_read_failed",)
+    present_by_email = {}
+    for location, email, _ in locations:
+        if location.location_state == "active" and _is_present(location, inventories):
+            present_by_email.setdefault(email.id, []).append(location)
+    for location, email, _ in locations:
+        if location.folder_name not in inventories or location.location_state != "active" or _is_present(location, inventories):
+            continue
+        matches = [other for other in present_by_email.get(email.id, ()) if other.id != location.id]
+        # A prior D1-C link is the only permitted move evidence. Ambiguous
+        # destination multiplicity remains an unavailable finding, not a move.
+        destination = matches[0] if len(matches) == 1 else None
+        folder = location.folder_name
+        try:
+            changed = _transaction(session_factory, lambda repo: _transition(
+                repo, account, _identity(location), "unavailable", _now(clock),
+                _identity(destination) if destination else None,
+            ))
+            if changed:
+                result = results[by_folder[folder]]
+                results[by_folder[folder]] = replace(
+                    result,
+                    moved=result.moved + (destination is not None),
+                    unavailable=result.unavailable + (destination is None),
+                )
+        except Exception:
+            result = results[by_folder[folder]]
+            results[by_folder[folder]] = replace(result, failure_codes=result.failure_codes + ("reconciliation_failed",))
+            return results, ()
+    return results, ()
+
+
 def synchronize_account(adapter, settings, session_factory, clock) -> SyncResult:
     """Ingest configured folders without mailbox mutation or real-account assumptions."""
     results, global_failures = [], []
+    inventories = {}
+    complete = None
     connected = False
     try:
         adapter.connect()
         connected = True
         folders = tuple(f.name for f in adapter.allowed_folders() if f.name in settings.folder_allowlist)
-        inventories, checkpoints, failures = {}, {}, {}
+        checkpoints, failures = {}, {}
         for folder in folders:
             try:
                 selected = adapter.select_read_only(folder)
@@ -229,5 +335,8 @@ def synchronize_account(adapter, settings, session_factory, clock) -> SyncResult
                 adapter.disconnect()
             except Exception:
                 global_failures.append("disconnect_failed")
+    if complete is not None and not global_failures and not any(result.failure_codes for result in results):
+        results, failures = _reconcile(settings.account_scope, complete, session_factory, clock, results)
+        global_failures.extend(failures)
     return SyncResult("degraded" if global_failures or any(r.failure_codes for r in results) else "success",
                       tuple(results), tuple(global_failures))

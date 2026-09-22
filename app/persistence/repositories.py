@@ -1035,3 +1035,35 @@ class IMAPSyncRepository:
 
     def list_source_locations(self, source: SourceRecord):
         return tuple(self.session.scalars(select(IMAPMessageLocation).join(EmailMessage, IMAPMessageLocation.email_message_id == EmailMessage.id).where(EmailMessage.source_record_id == source.id).order_by(IMAPMessageLocation.id)))
+
+    def list_account_locations(self, account_scope: str):
+        """Return technical locations and their owning email/source for one account."""
+        if not account_scope:
+            raise ValueError("IMAP account scope is required")
+        return tuple(self.session.execute(
+            select(IMAPMessageLocation, EmailMessage, SourceRecord)
+            .join(EmailMessage, IMAPMessageLocation.email_message_id == EmailMessage.id)
+            .join(SourceRecord, EmailMessage.source_record_id == SourceRecord.id)
+            .where(
+                IMAPMessageLocation.account_scope == account_scope,
+                SourceRecord.source_system_scope == account_scope,
+                SourceRecord.source_type == "email_message",
+            )
+            .order_by(IMAPMessageLocation.id)
+        ))
+
+    def email_attachment_values(self, email: EmailMessage):
+        """Read only approved metadata, never attachment bytes."""
+        return tuple({
+            "part_index": part.part_index,
+            "filename": part.filename,
+            "media_type": part.media_type,
+            "byte_size": part.byte_size,
+            "content_id": part.content_id,
+            "disposition": part.disposition,
+            "provenance": part.provenance,
+        } for part in self.session.scalars(
+            select(EmailAttachmentMetadata)
+            .where(EmailAttachmentMetadata.email_message_id == email.id)
+            .order_by(EmailAttachmentMetadata.part_index)
+        ))

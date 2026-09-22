@@ -205,6 +205,30 @@ def test_imap_reactivation_after_unavailable_appends_new_observation(db_session)
     assert second.outcome == "reactivated"
 
 
+def test_imap_account_location_inventory_and_attachment_values_are_scoped(db_session):
+    repo, source, email, location, when = _imap_occurrence(db_session)
+    linked = repo.link_location(email, "imap:account", "Sent", 42, 9, when)
+    repo.replace_attachments(email, [{
+        "part_index": 2, "filename": "synthetic.pdf", "media_type": "application/pdf",
+        "byte_size": 17, "content_id": None, "disposition": "attachment", "provenance": "imap_sync",
+    }])
+    other_source, other_email, other_location = repo.create_independent_occurrence(
+        "imap:other", "INBOX", 1, 1, when, {"normalized_message_id": "<other@test>"},
+    )
+    db_session.flush()
+    assert {row[0].id for row in repo.list_account_locations("imap:account")} == {location.id, linked.id}
+    assert all(row[1].id == email.id and row[2].id == source.id for row in repo.list_account_locations("imap:account"))
+    assert {row[0].id for row in repo.list_account_locations("imap:other")} == {other_location.id}
+    assert repo.list_account_locations("imap:missing") == ()
+    assert repo.email_attachment_values(email) == ({
+        "part_index": 2, "filename": "synthetic.pdf", "media_type": "application/pdf",
+        "byte_size": 17, "content_id": None, "disposition": "attachment", "provenance": "imap_sync",
+    },)
+    assert repo.email_attachment_values(other_email) == ()
+    with pytest.raises(ValueError):
+        repo.list_account_locations("")
+
+
 def test_imap_repository_never_commits_and_caller_rollback_removes_rows(db_session):
     repo, source, email, location, when = _imap_occurrence(db_session)
     repo.reserve_occurrence_identity(source, "imap:account", "INBOX", 42, 7)

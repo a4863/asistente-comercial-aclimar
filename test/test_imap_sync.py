@@ -134,7 +134,7 @@ def test_empty_initial_incremental_holes_restart_and_replay(factory):
     assert rows(factory, SynchronizationCheckpoint)[0].checkpoint_marker == "v1:42:12"
 
 
-def test_reset_restarts_window_and_preserves_old_location(factory):
+def test_reset_restarts_window_and_reconciles_old_location(factory):
     adapter = FakeAdapter({"INBOX": (42, {80: message(80)})})
     assert run(adapter, factory).state == "success"
     adapter.folders["INBOX"] = (43, {2: message(2)})
@@ -142,7 +142,8 @@ def test_reset_restarts_window_and_preserves_old_location(factory):
     assert result.state == "success" and result.folders[0].created == 1
     assert ("search_uids", "INBOX", date(2026, 8, 23)) in adapter.calls
     assert rows(factory, SynchronizationCheckpoint)[0].checkpoint_marker == "v1:43:2"
-    assert {(r.uidvalidity, r.uid, r.location_state) for r in rows(factory, IMAPMessageLocation)} == {(42, 80, "active"), (43, 2, "active")}
+    assert {(r.uidvalidity, r.uid, r.location_state) for r in rows(factory, IMAPMessageLocation)} == {(42, 80, "unavailable"), (43, 2, "active")}
+    assert result.folders[0].unavailable == 1
 
 
 def test_exact_replay_and_material_update(factory):
@@ -211,7 +212,7 @@ def test_partial_inventory_disables_correlation(factory):
     assert len(rows(factory, SourceRecord)) == 2
 
 
-def test_present_old_location_and_unavailable_replay_do_not_transition(factory):
+def test_present_old_location_reactivates_on_complete_replay(factory):
     adapter = FakeAdapter({"INBOX": (42, {1: message(1, normalized_message_id="<same@test>")}), "Sent": (42, {})})
     run(adapter, factory, "INBOX", "Sent")
     adapter.folders["Sent"][1][2] = message(2, normalized_message_id="<same@test>")
@@ -222,9 +223,10 @@ def test_present_old_location_and_unavailable_replay_do_not_transition(factory):
         location.location_state = "unavailable"
         session.delete(session.scalar(select(SynchronizationCheckpoint).where(SynchronizationCheckpoint.checkpoint_marker == "v1:42:1")))
     result = run(adapter, factory, "INBOX", "Sent")
-    assert result.state == "degraded"
-    assert result.folders[0].failure_codes == ("reactivation_deferred",)
-    assert next(r for r in rows(factory, IMAPMessageLocation) if r.uid == 1).location_state == "unavailable"
+    assert result.state == "success"
+    assert result.folders[0].reactivated == 1
+    assert next(r for r in rows(factory, IMAPMessageLocation) if r.uid == 1).location_state == "active"
+    assert any(observation.outcome == "reactivated" for observation in rows(factory, SourceObservation))
 
 
 def test_repository_write_failure_rolls_back_and_retries(factory, monkeypatch):
@@ -267,7 +269,6 @@ def test_repository_audit_and_commit_failures_rollback(factory, monkeypatch):
     class CommitFailSession:
         def __init__(self, inner):
             self.inner = inner
-            self.fail_once = True
 
         def __getattr__(self, name):
             return getattr(self.inner, name)
@@ -283,7 +284,7 @@ def test_repository_audit_and_commit_failures_rollback(factory, monkeypatch):
     def failing_factory():
         counter["calls"] += 1
         session = normal_factory()
-        # Inventory checkpoint read is the first session. Fail the message commit.
+        # Inventory reads are the first two sessions; fail the message commit.
         return CommitFailSession(session) if counter["calls"] == 3 else session
 
     result = run(adapter, failing_factory, "INBOX", "Sent")
@@ -291,3 +292,208 @@ def test_repository_audit_and_commit_failures_rollback(factory, monkeypatch):
     assert rows(factory, SynchronizationCheckpoint)[0].checkpoint_marker == "v1:42:2"
     assert 4 not in {r.uid for r in rows(factory, IMAPMessageLocation)}
     assert run(adapter, factory, "INBOX", "Sent").folders[0].created == 1
+
+
+def test_complete_move_preserves_source_and_replay_is_idempotent(factory):
+    original = message(1, normalized_message_id="<move@test>")
+    adapter = FakeAdapter({"INBOX": (42, {1: original}), "Sent": (42, {})})
+    assert run(adapter, factory, "INBOX", "Sent").state == "success"
+    source_id = rows(factory, SourceRecord)[0].id
+    adapter.folders["INBOX"][1].clear()
+    adapter.folders["Sent"][1][8] = message(8, normalized_message_id="<move@test>")
+    result = run(adapter, factory, "INBOX", "Sent")
+    assert result.state == "success" and result.folders[0].moved == 1
+    assert len(rows(factory, SourceRecord)) == len(rows(factory, EmailMessage)) == 1
+    assert rows(factory, SourceRecord)[0].id == source_id
+    locations = {r.uid: r for r in rows(factory, IMAPMessageLocation)}
+    assert locations[1].location_state == "unavailable"
+    assert locations[8].location_state == "active"
+    assert locations[1].email_message_id == locations[8].email_message_id
+    assert {r.outcome for r in rows(factory, SourceObservation)} >= {"ingested", "unavailable", "moved"}
+    assert {r.event_type for r in rows(factory, AuditEvent)} >= {"imap_location_transitioned", "imap_reconciled"}
+    counts = (len(rows(factory, SourceObservation)), len(rows(factory, AuditEvent)))
+    assert run(adapter, factory, "INBOX", "Sent").state == "success"
+    assert (len(rows(factory, SourceObservation)), len(rows(factory, AuditEvent))) == counts
+
+
+def test_ambiguous_move_remains_independent_and_old_becomes_unavailable(factory):
+    adapter = FakeAdapter({"INBOX": (42, {1: message(1, normalized_message_id="<duplicate@test>")}), "Sent": (42, {})})
+    run(adapter, factory, "INBOX", "Sent")
+    adapter.folders["INBOX"][1].clear()
+    adapter.folders["Sent"][1][2] = message(2, normalized_message_id="<duplicate@test>", subject="Conflicting")
+    result = run(adapter, factory, "INBOX", "Sent")
+    assert result.state == "success" and result.folders[0].unavailable == 1 and result.folders[0].moved == 0
+    assert len(rows(factory, SourceRecord)) == 2
+    assert len({r.email_message_id for r in rows(factory, IMAPMessageLocation)}) == 2
+    assert not any(r.outcome == "moved" for r in rows(factory, SourceObservation))
+
+
+def test_allowlist_expansion_is_included_in_complete_move_evidence(factory):
+    adapter = FakeAdapter({"INBOX": (42, {1: message(1, normalized_message_id="<expand@test>")}), "Archive": (42, {})})
+    assert run(adapter, factory, "INBOX").state == "success"
+    adapter.folders["INBOX"][1].clear()
+    adapter.folders["Archive"][1][7] = message(7, normalized_message_id="<expand@test>")
+    result = run(adapter, factory, "INBOX", "Archive")
+    assert result.state == "success" and result.folders[0].moved == 1
+    assert len(rows(factory, SourceRecord)) == 1
+    assert {r.folder_name for r in rows(factory, IMAPMessageLocation)} == {"INBOX", "Archive"}
+
+
+def test_reappearance_waits_for_complete_allowlist(factory):
+    adapter = FakeAdapter({"INBOX": (42, {1: message(1)}), "Sent": (42, {})})
+    run(adapter, factory, "INBOX", "Sent")
+    adapter.folders["INBOX"][1].clear()
+    assert run(adapter, factory, "INBOX", "Sent").folders[0].unavailable == 1
+    adapter.folders["INBOX"][1][1] = message(1)
+    adapter.fail.add(("inventory", "Sent"))
+    result = run(adapter, factory, "INBOX", "Sent")
+    assert result.state == "degraded"
+    assert rows(factory, IMAPMessageLocation)[0].location_state == "unavailable"
+    adapter.fail.clear()
+    result = run(adapter, factory, "INBOX", "Sent")
+    assert result.state == "success" and result.folders[0].reactivated == 1
+    assert rows(factory, IMAPMessageLocation)[0].location_state == "active"
+
+
+def test_missing_location_unavailable_then_repeated_reactivation(factory):
+    adapter = FakeAdapter({"INBOX": (42, {1: message(1)})})
+    run(adapter, factory)
+    source_id = rows(factory, SourceRecord)[0].id
+    for expected_state, expected_event, present in (
+        ("unavailable", "unavailable", False),
+        ("active", "reactivated", True),
+        ("unavailable", "unavailable", False),
+        ("active", "reactivated", True),
+    ):
+        if present:
+            adapter.folders["INBOX"][1][1] = message(1)
+        else:
+            adapter.folders["INBOX"][1].clear()
+        result = run(adapter, factory)
+        assert result.state == "success"
+        assert rows(factory, IMAPMessageLocation)[0].location_state == expected_state
+        assert rows(factory, SourceObservation)[-1].outcome == expected_event
+        count = len(rows(factory, SourceObservation))
+        run(adapter, factory)
+        assert len(rows(factory, SourceObservation)) == count
+    assert rows(factory, SourceRecord)[0].id == source_id
+    assert rows(factory, SourceRecord)[0].retention_state == "active"
+    assert len(rows(factory, EmailMessage)) == len(rows(factory, EmailAttachmentMetadata)) == 1
+    assert [r.outcome for r in rows(factory, SourceObservation)] == [
+        "ingested", "unavailable", "reactivated", "unavailable", "reactivated",
+    ]
+
+
+def test_incomplete_inventory_or_ingestion_blocks_all_transitions(factory, monkeypatch):
+    from app.persistence.repositories import IMAPSyncRepository
+    adapter = FakeAdapter({"INBOX": (42, {1: message(1)}), "Sent": (42, {})})
+    run(adapter, factory, "INBOX", "Sent")
+    adapter.folders["INBOX"][1].clear()
+    adapter.fail.add(("inventory", "Sent"))
+    result = run(adapter, factory, "INBOX", "Sent")
+    assert result.state == "degraded"
+    assert rows(factory, IMAPMessageLocation)[0].location_state == "active"
+    adapter.fail.clear()
+    adapter.folders["Sent"][1][2] = message(2)
+    original = IMAPSyncRepository.reserve_occurrence_identity
+
+    def fail_new_uid(self, source, account, folder, uidvalidity, uid):
+        if uid == 2:
+            raise RuntimeError("SECRET write failure")
+        return original(self, source, account, folder, uidvalidity, uid)
+
+    monkeypatch.setattr(IMAPSyncRepository, "reserve_occurrence_identity", fail_new_uid)
+    result = run(adapter, factory, "INBOX", "Sent")
+    assert result.state == "degraded" and "SECRET" not in repr(result)
+    assert rows(factory, IMAPMessageLocation)[0].location_state == "active"
+    monkeypatch.setattr(IMAPSyncRepository, "reserve_occurrence_identity", original)
+    result = run(adapter, factory, "INBOX", "Sent")
+    assert result.state == "success" and result.folders[0].unavailable == 1
+
+
+def test_uidvalidity_reset_waits_for_complete_coverage_and_correlates(factory):
+    adapter = FakeAdapter({"INBOX": (42, {80: message(80, normalized_message_id="<reset@test>")}), "Sent": (42, {})})
+    run(adapter, factory, "INBOX", "Sent")
+    adapter.folders["INBOX"] = (43, {2: message(2, normalized_message_id="<reset@test>")})
+    adapter.fail.add(("inventory", "Sent"))
+    result = run(adapter, factory, "INBOX", "Sent")
+    assert result.state == "degraded"
+    assert next(r for r in rows(factory, IMAPMessageLocation) if r.uid == 80).location_state == "active"
+    # Correlation is disabled in the partial run; the new occurrence stays
+    # independent, and the old namespace is only reconciled on full coverage.
+    assert len(rows(factory, SourceRecord)) == 2
+    adapter.fail.clear()
+    result = run(adapter, factory, "INBOX", "Sent")
+    assert result.state == "success" and result.folders[0].unavailable == 1
+    assert next(r for r in rows(factory, IMAPMessageLocation) if r.uid == 80).location_state == "unavailable"
+    assert rows(factory, SynchronizationCheckpoint)[0].checkpoint_marker == "v1:43:2"
+
+
+def test_uidvalidity_reset_unambiguous_replacement_is_move(factory):
+    adapter = FakeAdapter({"INBOX": (42, {80: message(80, normalized_message_id="<reset@test>")})})
+    run(adapter, factory)
+    adapter.folders["INBOX"] = (43, {2: message(2, normalized_message_id="<reset@test>")})
+    result = run(adapter, factory)
+    assert result.state == "success" and result.folders[0].moved == 1
+    assert len(rows(factory, SourceRecord)) == 1
+    assert {(r.uidvalidity, r.location_state) for r in rows(factory, IMAPMessageLocation)} == {
+        (42, "unavailable"), (43, "active"),
+    }
+
+
+@pytest.mark.parametrize("stage", ["state", "observation", "audit", "commit"])
+def test_reconciliation_failure_rolls_back_and_later_retries(factory, monkeypatch, stage):
+    from app.persistence.repositories import IMAPSyncRepository
+    adapter = FakeAdapter({"INBOX": (42, {1: message(1)})})
+    run(adapter, factory)
+    adapter.folders["INBOX"][1].clear()
+    original_state = IMAPSyncRepository.set_location_state
+    original_observation = IMAPSyncRepository.append_observation
+    original_audit = IMAPSyncRepository.append_audit
+
+    def state_failure(self, *args, **kwargs):
+        raise RuntimeError("SECRET state failure")
+
+    def observation_failure(self, *args, **kwargs):
+        raise RuntimeError("SECRET observation failure")
+
+    def audit_failure(self, *args, **kwargs):
+        raise RuntimeError("SECRET audit failure")
+
+    def marked_audit(self, *args, **kwargs):
+        self.session.info["transition_commit_failure"] = True
+        return original_audit(self, *args, **kwargs)
+
+    if stage == "state":
+        monkeypatch.setattr(IMAPSyncRepository, "set_location_state", state_failure)
+    elif stage == "observation":
+        monkeypatch.setattr(IMAPSyncRepository, "append_observation", observation_failure)
+    elif stage == "audit":
+        monkeypatch.setattr(IMAPSyncRepository, "append_audit", audit_failure)
+    else:
+        monkeypatch.setattr(IMAPSyncRepository, "append_audit", marked_audit)
+
+    def failing_factory():
+        session = factory()
+        original_commit = session.commit
+
+        def commit():
+            if session.info.get("transition_commit_failure"):
+                raise RuntimeError("SECRET commit failure")
+            return original_commit()
+
+        session.commit = commit
+        return session
+
+    before = (len(rows(factory, SourceObservation)), len(rows(factory, AuditEvent)))
+    result = run(adapter, failing_factory if stage == "commit" else factory)
+    assert result.state == "degraded"
+    assert result.folders[0].failure_codes == ("reconciliation_failed",)
+    assert "SECRET" not in repr(result)
+    assert rows(factory, IMAPMessageLocation)[0].location_state == "active"
+    assert (len(rows(factory, SourceObservation)), len(rows(factory, AuditEvent))) == before
+    monkeypatch.setattr(IMAPSyncRepository, "set_location_state", original_state)
+    monkeypatch.setattr(IMAPSyncRepository, "append_observation", original_observation)
+    monkeypatch.setattr(IMAPSyncRepository, "append_audit", original_audit)
+    assert run(adapter, factory).folders[0].unavailable == 1
+    assert run(adapter, factory).folders[0].unavailable == 0
