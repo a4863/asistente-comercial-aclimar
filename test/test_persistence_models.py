@@ -4,19 +4,26 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.persistence.models import (
+    ActionProposal,
     Alert,
+    ApprovalDecision,
     CRMContextLink,
     CRMReference,
     Commitment,
     Conversation,
     ConversationMembership,
+    ExecutionResult,
     ExtractedFact,
+    FollowUpPreference,
+    FollowUpPreferenceHistory,
     Inference,
     InferenceSupport,
     IdentityLink,
     IdentityLinkCorrection,
+    IdempotencyIdentity,
     ManualNote,
     NextStep,
+    OperationalEvidenceLink,
     Proposal,
     ProposalSupport,
     Question,
@@ -314,3 +321,214 @@ def test_alert_recurrence_allowed_after_resolution(db_session):
     current = Alert(**base, state="active")
     db_session.add_all([closed, current])
     db_session.flush()
+
+
+
+def test_follow_up_preference_allows_one_current_per_scope(db_session):
+    first = FollowUpPreference(
+        scope_type="company",
+        scope_reference="crm-1",
+        classification="manual",
+        inactivity_days=7,
+        provenance="test",
+    )
+    db_session.add(first)
+    db_session.flush()
+    duplicate = FollowUpPreference(
+        scope_type="company",
+        scope_reference="crm-1",
+        classification="manual",
+        inactivity_days=5,
+        provenance="test",
+    )
+    db_session.add(duplicate)
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_follow_up_global_scope_is_unique(db_session):
+    first = FollowUpPreference(
+        scope_type="global",
+        scope_reference=None,
+        classification="default",
+        inactivity_days=7,
+        provenance="test",
+    )
+    db_session.add(first)
+    db_session.flush()
+    duplicate = FollowUpPreference(
+        scope_type="global",
+        scope_reference=None,
+        classification="default",
+        inactivity_days=5,
+        provenance="test",
+    )
+    db_session.add(duplicate)
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_follow_up_history_is_separate_append_only_table(db_session):
+    preference = FollowUpPreference(
+        scope_type="contact",
+        scope_reference="crm-2",
+        classification="manual",
+        inactivity_days=7,
+        provenance="test",
+    )
+    db_session.add(preference)
+    db_session.flush()
+    history = FollowUpPreferenceHistory(
+        follow_up_preference_id=preference.id,
+        scope_type=preference.scope_type,
+        scope_reference=preference.scope_reference,
+        classification=preference.classification,
+        inactivity_days=preference.inactivity_days,
+        explicit_future_date=None,
+        provenance="test",
+    )
+    db_session.add(history)
+    db_session.flush()
+    assert history.follow_up_preference_id == preference.id
+
+
+def _idempotency(db_session, key):
+    record = IdempotencyIdentity(
+        operation_kind="action",
+        scope="test",
+        identity_key=key,
+    )
+    db_session.add(record)
+    db_session.flush()
+    return record
+
+
+def test_action_proposal_state_and_idempotency_identity_constraints(db_session):
+    identity = _idempotency(db_session, "action-1")
+    proposal = ActionProposal(
+        action_type="create_draft",
+        target_type="email",
+        target_reference="msg-1",
+        state="pending_approval",
+        idempotency_identity_id=identity.id,
+        provenance="test",
+    )
+    db_session.add(proposal)
+    db_session.flush()
+
+    invalid_identity = _idempotency(db_session, "action-2")
+    db_session.add(
+        ActionProposal(
+            action_type="create_draft",
+            target_type="email",
+            target_reference="msg-2",
+            state="invalid",
+            idempotency_identity_id=invalid_identity.id,
+            provenance="test",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_approval_decision_is_one_per_action_proposal(db_session):
+    identity = _idempotency(db_session, "decision-1")
+    proposal = ActionProposal(
+        action_type="move_email",
+        target_type="email",
+        target_reference="msg-3",
+        idempotency_identity_id=identity.id,
+        provenance="test",
+    )
+    db_session.add(proposal)
+    db_session.flush()
+    first = ApprovalDecision(
+        action_proposal_id=proposal.id,
+        decision="approved",
+        actor_reference="user",
+        provenance="test",
+    )
+    db_session.add(first)
+    db_session.flush()
+    db_session.add(
+        ApprovalDecision(
+            action_proposal_id=proposal.id,
+            decision="rejected",
+            actor_reference="user",
+            provenance="test",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_execution_result_requires_valid_outcome_and_revalidation(db_session):
+    identity = _idempotency(db_session, "exec-1")
+    proposal = ActionProposal(
+        action_type="crm_write",
+        target_type="crm",
+        target_reference="opportunity-1",
+        idempotency_identity_id=identity.id,
+        provenance="test",
+    )
+    db_session.add(proposal)
+    db_session.flush()
+    decision = ApprovalDecision(
+        action_proposal_id=proposal.id,
+        decision="approved",
+        actor_reference="user",
+        provenance="test",
+    )
+    db_session.add(decision)
+    db_session.flush()
+    result = ExecutionResult(
+        action_proposal_id=proposal.id,
+        approval_decision_id=decision.id,
+        revalidation_reference="snapshot-1",
+        outcome="executed",
+        provenance="test",
+    )
+    db_session.add(result)
+    db_session.flush()
+
+    db_session.add(
+        ExecutionResult(
+            action_proposal_id=proposal.id,
+            approval_decision_id=decision.id,
+            revalidation_reference="snapshot-2",
+            outcome="invalid",
+            provenance="test",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+@pytest.mark.parametrize(
+    ("evidence_type", "evidence_id", "evidence_reference", "valid"),
+    [
+        ("source", 1, None, True),
+        ("fact", 1, "fact:1", True),
+        ("user_confirmation", None, "confirmed-by-user", True),
+        ("user_confirmation", 1, "confirmed-by-user", False),
+        ("source", None, None, False),
+        ("unknown", 1, None, False),
+    ],
+)
+def test_operational_evidence_shape_constraints(
+    db_session, evidence_type, evidence_id, evidence_reference, valid
+):
+    link = OperationalEvidenceLink(
+        operational_type="task",
+        operational_id=1,
+        evidence_type=evidence_type,
+        evidence_id=evidence_id,
+        evidence_reference=evidence_reference,
+        provenance="test",
+    )
+    db_session.add(link)
+    if valid:
+        db_session.flush()
+    else:
+        with pytest.raises(IntegrityError):
+            db_session.flush()
