@@ -181,6 +181,30 @@ def test_imap_observation_transition_audit_and_checkpoint(db_session):
         repo.read_folder_checkpoint("imap:account", "INBOX")
 
 
+def test_imap_reactivation_after_unavailable_appends_new_observation(db_session):
+    repo, source, email, location, when = _imap_occurrence(db_session)
+    digest = "c" * 64
+
+    first, first_created = repo.append_observation(source, location, "reactivated", digest, when)
+    db_session.flush()
+    assert first_created is True
+
+    repo.set_location_state(location, "unavailable", when)
+    unavailable, unavailable_created = repo.append_observation(source, location, "unavailable", digest, when)
+    db_session.flush()
+    assert unavailable_created is True
+
+    repo.set_location_state(location, "active", when)
+    second, second_created = repo.append_observation(source, location, "reactivated", digest, when)
+    db_session.flush()
+
+    assert second_created is True
+    assert second.id != first.id
+    assert second.id != unavailable.id
+    assert second.observed_state == "active"
+    assert second.outcome == "reactivated"
+
+
 def test_imap_repository_never_commits_and_caller_rollback_removes_rows(db_session):
     repo, source, email, location, when = _imap_occurrence(db_session)
     repo.reserve_occurrence_identity(source, "imap:account", "INBOX", 42, 7)
