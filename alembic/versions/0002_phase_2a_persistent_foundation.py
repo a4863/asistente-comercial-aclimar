@@ -308,7 +308,11 @@ def upgrade():
         sa.Column("confirmed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("provenance", sa.String(length=255), nullable=False),
         sa.CheckConstraint(
-            "confirmation_state != 'confirmed' OR confirmed_at IS NOT NULL",
+            "confirmation_state IN ('ambiguous', 'proposed', 'confirmed')",
+            name="ck_crm_context_link_confirmation_state",
+        ),
+        sa.CheckConstraint(
+            "(confirmation_state = 'confirmed' AND confirmed_at IS NOT NULL) OR (confirmation_state != 'confirmed' AND confirmed_at IS NULL)",
             name="ck_crm_context_link_confirmed_at",
         ),
     )
@@ -368,6 +372,10 @@ def upgrade():
         ),
         sa.Column("support_type", sa.String(length=30), nullable=False),
         sa.Column("support_id", sa.Integer(), nullable=False),
+        sa.CheckConstraint(
+            "support_type IN ('source', 'fact', 'inference')",
+            name="ck_inference_support_type",
+        ),
         sa.UniqueConstraint(
             "inference_id",
             "support_type",
@@ -388,6 +396,10 @@ def upgrade():
         ),
         sa.Column("support_type", sa.String(length=30), nullable=False),
         sa.Column("support_id", sa.Integer(), nullable=False),
+        sa.CheckConstraint(
+            "support_type IN ('source', 'fact', 'inference', 'proposal')",
+            name="ck_proposal_support_type",
+        ),
         sa.UniqueConstraint(
             "proposal_id",
             "support_type",
