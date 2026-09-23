@@ -264,9 +264,17 @@ def synchronize_account(adapter, settings, session_factory, clock) -> SyncResult
     try:
         adapter.connect()
         connected = True
-        folders = tuple(f.name for f in adapter.allowed_folders() if f.name in settings.folder_allowlist)
-        checkpoints, failures = {}, {}
+        available_folders = {folder.name for folder in adapter.allowed_folders()}
+        folders = tuple(dict.fromkeys(settings.folder_allowlist))
+        checkpoints = {}
+        failures = {
+            folder: "folder_unavailable"
+            for folder in folders
+            if folder not in available_folders
+        }
         for folder in folders:
+            if folder in failures:
+                continue
             try:
                 selected = adapter.select_read_only(folder)
                 if not isinstance(selected.uidvalidity, int) or selected.uidvalidity <= 0:
