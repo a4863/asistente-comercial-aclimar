@@ -101,6 +101,13 @@ FOLLOW_UP_SCOPE_RANK = {
 
 
 @dataclass(frozen=True, slots=True)
+class AccountThreadMember:
+    source_record_id: int
+    source_type: str
+    account_scope: str
+
+
+@dataclass(frozen=True, slots=True)
 class AccountThreadSource:
     source_record_id: int
     account_scope: str
@@ -116,6 +123,7 @@ class AccountThreadSource:
     conversation_legacy_status: str | None
     conversation_superseded_at: datetime | None
     full_current_member_ids: tuple[int, ...]
+    full_current_members: tuple[AccountThreadMember, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1221,6 +1229,7 @@ class ThreadPersistenceRepository:
         touched_ids = tuple(sorted({row.conversation_id for row in memberships.values()}))
         conversations = {}
         member_sets = {}
+        member_details = {}
         if touched_ids:
             conversations = {row.id: row for row in self.session.scalars(
                 select(Conversation).where(Conversation.id.in_(touched_ids)).order_by(Conversation.id)
@@ -1231,13 +1240,26 @@ class ThreadPersistenceRepository:
                 ConversationMembership.conversation_id.in_(touched_ids)
             ).order_by(ConversationMembership.conversation_id,
                        ConversationMembership.source_record_id, ConversationMembership.id)).all()
+            member_source_ids = tuple(sorted({member.source_record_id for member in members}))
+            member_sources = {row.id: row for row in self.session.scalars(
+                select(SourceRecord).where(SourceRecord.id.in_(member_source_ids)).order_by(SourceRecord.id)
+            )} if member_source_ids else {}
+            if len(member_sources) != len(member_source_ids):
+                raise ValueError("current membership points to missing source")
             for member in members:
                 member_sets.setdefault(member.conversation_id, []).append(member.source_record_id)
+                source_row = member_sources[member.source_record_id]
+                member_details.setdefault(member.conversation_id, []).append(AccountThreadMember(
+                    source_record_id=source_row.id,
+                    source_type=source_row.source_type,
+                    account_scope=source_row.source_system_scope,
+                ))
             for conversation_id in touched_ids:
                 ids = member_sets.get(conversation_id, [])
                 if len(ids) != len(set(ids)) or not ids:
                     raise ValueError("inconsistent current conversation membership")
                 member_sets[conversation_id] = tuple(ids)
+                member_details[conversation_id] = tuple(member_details[conversation_id])
             for source_id, membership in memberships.items():
                 if source_id not in member_sets[membership.conversation_id]:
                     raise ValueError("inconsistent current conversation membership")
@@ -1263,6 +1285,7 @@ class ThreadPersistenceRepository:
                 conversation_legacy_status=conversation.legacy_status if conversation else None,
                 conversation_superseded_at=conversation.superseded_at if conversation else None,
                 full_current_member_ids=member_sets[membership.conversation_id] if membership else (),
+                full_current_members=member_details[membership.conversation_id] if membership else (),
             ))
         return AccountThreadSnapshot(account_scope, tuple(result))
 
