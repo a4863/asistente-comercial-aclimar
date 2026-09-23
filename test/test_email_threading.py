@@ -218,7 +218,7 @@ def test_fingerprints_and_input_validation():
     empty = reconstruct_threads("account", ())
     assert empty.components == empty.edges == empty.evidence == empty.decisions == empty.subjects == ()
     assert empty.reconstruction_key == sha256(b"3d2/reconstruction/v1" + b"7:account" + b"1:1" + b"1:0").hexdigest()
-    for account, corpus in [("", ()), ("x" * 101, ()), ("account", (sample, sample)),
+    for account, corpus in [("", ()), ("   ", ()), ("x" * 101, ()), ("account", (sample, sample)),
                             ("account", (EmailThreadInput("account", 0, None, None, None, None, "0" * 64),)),
                             ("account", (message(1, scope="other"),)),
                             ("account", (EmailThreadInput("account", 1, "x@d", None, None, None, "0" * 64),))]:
