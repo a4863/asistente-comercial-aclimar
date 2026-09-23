@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
+from dataclasses import FrozenInstanceError
 from hashlib import sha256
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -10,6 +12,8 @@ from app.persistence.models import (
     ApprovalDecision,
     AuditEvent,
     Commitment,
+    Conversation,
+    ConversationMembership,
     ExecutionResult,
     CRMContextLink,
     EmailAttachmentMetadata,
@@ -384,6 +388,136 @@ def _thread_source(db_session, scope="imap:one", message_id="<one@example.test>"
                                 references_header="<root@example.test>", provenance="test"))
     db_session.flush()
     return source
+
+
+def _snapshot_membership(db_session, source, conversation):
+    row = ConversationMembership(source_record_id=source.id,
+        conversation_id=conversation.id, evidence_type="singleton",
+        evidence_reference=f"source:{source.id}")
+    db_session.add(row)
+    db_session.flush()
+    return row
+
+
+def test_account_thread_snapshot_empty_scope_and_no_commit(db_session, monkeypatch):
+    repo = _thread_repo(db_session)
+    monkeypatch.setattr(db_session, "commit", lambda: pytest.fail("snapshot committed"))
+    assert repo.load_account_thread_snapshot("imap:one").sources == ()
+    for scope in ("", " ", "x" * 101, None):
+        with pytest.raises(ValueError, match="scope"):
+            repo.load_account_thread_snapshot(scope)
+    source = _thread_source(db_session)
+    email = db_session.scalar(select(EmailMessage).where(EmailMessage.source_record_id == source.id))
+    email.in_reply_to = "<parent@example.test>"
+    email.subject = "Synthetic subject"
+    email.normalized_body = "private body"
+    db_session.flush()
+    snapshot = repo.load_account_thread_snapshot("imap:one")
+    assert snapshot.account_scope == "imap:one"
+    assert len(snapshot.sources) == 1
+    row = snapshot.sources[0]
+    assert (row.source_record_id, row.eligible, row.normalized_message_id,
+            row.in_reply_to, row.references_header, row.subject) == (
+            source.id, True, "<one@example.test>", "<parent@example.test>",
+            "<root@example.test>", "Synthetic subject")
+    assert row.current_conversation_id is None and row.full_current_member_ids == ()
+    assert not hasattr(row, "normalized_body")
+    with pytest.raises(FrozenInstanceError):
+        row.subject = "changed"
+
+
+@pytest.mark.parametrize("locations", ["none", "unavailable", "multiple"])
+def test_account_thread_snapshot_ignores_imap_location_cardinality(db_session, locations):
+    repo = _thread_repo(db_session)
+    source = _thread_source(db_session)
+    email = db_session.scalar(select(EmailMessage).where(EmailMessage.source_record_id == source.id))
+    if locations != "none":
+        for uid in range(1, 3 if locations == "multiple" else 2):
+            db_session.add(IMAPMessageLocation(email_message_id=email.id,
+                account_scope="imap:one", folder_name="INBOX", uidvalidity=1, uid=uid,
+                location_state="unavailable", last_observed_at=datetime.now(timezone.utc),
+                provenance="test"))
+        db_session.flush()
+    assert [row.source_record_id for row in repo.load_account_thread_snapshot("imap:one").sources] == [source.id]
+
+
+@pytest.mark.parametrize("state", ["deleted", "redacted"])
+def test_account_thread_snapshot_excludes_valid_terminal_source(db_session, state):
+    repo = _thread_repo(db_session)
+    source = _thread_source(db_session)
+    source.retention_state = state
+    source.deleted_or_redacted_at = datetime.now(timezone.utc)
+    db_session.flush()
+    row = repo.load_account_thread_snapshot("imap:one").sources[0]
+    assert row.source_record_id == source.id and row.eligible is False
+    assert row.deleted_or_redacted_at is not None
+    assert row.normalized_message_id is None
+
+
+@pytest.mark.parametrize("state,timestamp", [
+    ("active", True), ("deleted", False), ("redacted", False), ("unknown", False),
+])
+def test_account_thread_snapshot_rejects_invalid_retention(db_session, state, timestamp):
+    repo = _thread_repo(db_session)
+    source = _thread_source(db_session)
+    source.retention_state = state
+    source.deleted_or_redacted_at = datetime.now(timezone.utc) if timestamp else None
+    db_session.flush()
+    with pytest.raises(ValueError, match="retention state"):
+        repo.load_account_thread_snapshot("imap:one")
+
+
+def test_account_thread_snapshot_rejects_missing_email(db_session):
+    repo = _thread_repo(db_session)
+    db_session.add(SourceRecord(source_type="email_message", source_system_scope="imap:one",
+                                provenance="test"))
+    db_session.flush()
+    with pytest.raises(ValueError, match="missing EmailMessage"):
+        repo.load_account_thread_snapshot("imap:one")
+
+
+@pytest.mark.parametrize("kind", ["resolved", "legacy", "superseded", "foreign"])
+def test_account_thread_snapshot_surfaces_touched_conversation_state(db_session, kind):
+    repo = _thread_repo(db_session)
+    source = _thread_source(db_session)
+    if kind == "legacy":
+        conversation = Conversation(account_scope=None, legacy_status="legacy_unresolved",
+            stable_key=str(uuid4()), provenance="test")
+        db_session.add(conversation)
+        db_session.flush()
+    else:
+        conversation = repo.create_resolved_conversation(
+            "imap:other" if kind == "foreign" else "imap:one", "test")
+    if kind == "superseded":
+        conversation.superseded_at = datetime.now(timezone.utc)
+    _snapshot_membership(db_session, source, conversation)
+    row = repo.load_account_thread_snapshot("imap:one").sources[0]
+    assert row.current_conversation_id == conversation.id
+    assert row.conversation_account_scope == conversation.account_scope
+    assert row.conversation_legacy_status == conversation.legacy_status
+    assert (row.conversation_superseded_at is not None) == (kind == "superseded")
+    assert row.full_current_member_ids == (source.id,)
+
+
+def test_account_thread_snapshot_full_members_and_deterministic_order(db_session):
+    repo = _thread_repo(db_session)
+    first = _thread_source(db_session)
+    excluded = _thread_source(db_session, message_id="<excluded@example.test>")
+    other = _source(db_session)
+    last = _thread_source(db_session, message_id="<last@example.test>")
+    foreign = _thread_source(db_session, scope="imap:other")
+    excluded.retention_state = "redacted"
+    excluded.deleted_or_redacted_at = datetime.now(timezone.utc)
+    conversation = repo.create_resolved_conversation("imap:one", "test")
+    for source in (last, other, excluded, first):
+        _snapshot_membership(db_session, source, conversation)
+    rows = repo.load_account_thread_snapshot("imap:one").sources
+    assert tuple(row.source_record_id for row in rows) == (first.id, excluded.id, last.id)
+    assert tuple(row.eligible for row in rows) == (True, False, True)
+    assert rows[1].current_conversation_id is None
+    assert rows[0].full_current_member_ids == tuple(sorted((first.id, excluded.id, other.id, last.id)))
+    assert rows[2].full_current_member_ids == rows[0].full_current_member_ids
+    assert foreign.id not in [row.source_record_id for row in rows]
 
 
 def _thread_evidence(repo, source, token="one@example.test"):

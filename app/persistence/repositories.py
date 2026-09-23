@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from hashlib import sha256
 import re
 from uuid import UUID, uuid4
@@ -97,6 +98,30 @@ FOLLOW_UP_SCOPE_RANK = {
     "contact": 1,
     "global": 2,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class AccountThreadSource:
+    source_record_id: int
+    account_scope: str
+    retention_state: str
+    deleted_or_redacted_at: datetime | None
+    eligible: bool
+    normalized_message_id: str | None
+    in_reply_to: str | None
+    references_header: str | None
+    subject: str | None
+    current_conversation_id: int | None
+    conversation_account_scope: str | None
+    conversation_legacy_status: str | None
+    conversation_superseded_at: datetime | None
+    full_current_member_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AccountThreadSnapshot:
+    account_scope: str
+    sources: tuple[AccountThreadSource, ...]
 
 
 class SourceRepository:
@@ -1151,6 +1176,95 @@ class ThreadPersistenceRepository:
         return tuple(self.session.scalars(select(Conversation).where(
             Conversation.account_scope == account_scope, Conversation.legacy_status == "resolved"
         ).order_by(Conversation.id)))
+
+    def load_account_thread_snapshot(self, account_scope: str) -> AccountThreadSnapshot:
+        """Read the account's logical email corpus in the caller-owned transaction."""
+        self._require_scope(account_scope)
+        sources = self.session.scalars(select(SourceRecord).where(
+            SourceRecord.source_type == "email_message",
+            SourceRecord.source_system_scope == account_scope,
+        ).order_by(SourceRecord.id)).all()
+        if not sources:
+            return AccountThreadSnapshot(account_scope, ())
+
+        source_ids = tuple(source.id for source in sources)
+        emails = self.session.scalars(select(EmailMessage).where(
+            EmailMessage.source_record_id.in_(source_ids)
+        ).order_by(EmailMessage.source_record_id, EmailMessage.id)).all()
+        email_by_source = {}
+        for email in emails:
+            if email.source_record_id in email_by_source:
+                raise ValueError("duplicate logical EmailMessage representation")
+            email_by_source[email.source_record_id] = email
+
+        eligible_ids = set()
+        for source in sources:
+            state, timestamp = source.retention_state, source.deleted_or_redacted_at
+            if not ((state == "active" and timestamp is None)
+                    or (state in {"deleted", "redacted"} and timestamp is not None)):
+                raise ValueError("invalid email source retention state")
+            if source.id not in email_by_source:
+                raise ValueError("email source missing EmailMessage representation")
+            if state == "active":
+                eligible_ids.add(source.id)
+
+        memberships = {}
+        if eligible_ids:
+            rows = self.session.scalars(select(ConversationMembership).where(
+                ConversationMembership.source_record_id.in_(eligible_ids)
+            ).order_by(ConversationMembership.source_record_id, ConversationMembership.id)).all()
+            for membership in rows:
+                if membership.source_record_id in memberships:
+                    raise ValueError("duplicate current email membership")
+                memberships[membership.source_record_id] = membership
+
+        touched_ids = tuple(sorted({row.conversation_id for row in memberships.values()}))
+        conversations = {}
+        member_sets = {}
+        if touched_ids:
+            conversations = {row.id: row for row in self.session.scalars(
+                select(Conversation).where(Conversation.id.in_(touched_ids)).order_by(Conversation.id)
+            )}
+            if len(conversations) != len(touched_ids):
+                raise ValueError("current membership points to missing conversation")
+            members = self.session.scalars(select(ConversationMembership).where(
+                ConversationMembership.conversation_id.in_(touched_ids)
+            ).order_by(ConversationMembership.conversation_id,
+                       ConversationMembership.source_record_id, ConversationMembership.id)).all()
+            for member in members:
+                member_sets.setdefault(member.conversation_id, []).append(member.source_record_id)
+            for conversation_id in touched_ids:
+                ids = member_sets.get(conversation_id, [])
+                if len(ids) != len(set(ids)) or not ids:
+                    raise ValueError("inconsistent current conversation membership")
+                member_sets[conversation_id] = tuple(ids)
+            for source_id, membership in memberships.items():
+                if source_id not in member_sets[membership.conversation_id]:
+                    raise ValueError("inconsistent current conversation membership")
+
+        result = []
+        for source in sources:
+            eligible = source.id in eligible_ids
+            email = email_by_source[source.id]
+            membership = memberships.get(source.id)
+            conversation = conversations[membership.conversation_id] if membership else None
+            result.append(AccountThreadSource(
+                source_record_id=source.id,
+                account_scope=account_scope,
+                retention_state=source.retention_state,
+                deleted_or_redacted_at=source.deleted_or_redacted_at,
+                eligible=eligible,
+                normalized_message_id=email.normalized_message_id if eligible else None,
+                in_reply_to=email.in_reply_to if eligible else None,
+                references_header=email.references_header if eligible else None,
+                subject=email.subject if eligible else None,
+                current_conversation_id=membership.conversation_id if membership else None,
+                conversation_account_scope=conversation.account_scope if conversation else None,
+                conversation_legacy_status=conversation.legacy_status if conversation else None,
+                conversation_superseded_at=conversation.superseded_at if conversation else None,
+                full_current_member_ids=member_sets[membership.conversation_id] if membership else (),
+            ))
+        return AccountThreadSnapshot(account_scope, tuple(result))
 
     def create_resolved_conversation(self, account_scope: str, provenance: str):
         self._require_scope(account_scope)
