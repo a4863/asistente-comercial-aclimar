@@ -339,6 +339,21 @@ def test_allowlist_expansion_is_included_in_complete_move_evidence(factory):
     assert {r.folder_name for r in rows(factory, IMAPMessageLocation)} == {"INBOX", "Archive"}
 
 
+def test_missing_configured_folder_blocks_reconciliation(factory):
+    adapter = FakeAdapter({"INBOX": (42, {1: message(1)})})
+    assert run(adapter, factory, "INBOX").state == "success"
+
+    adapter.folders["INBOX"][1].clear()
+    result = run(adapter, factory, "INBOX", "Sent")
+
+    assert result.state == "degraded"
+    assert tuple(r.folder for r in result.folders) == ("INBOX", "Sent")
+    sent = next(r for r in result.folders if r.folder == "Sent")
+    assert sent.failure_codes == ("folder_unavailable",)
+    assert rows(factory, IMAPMessageLocation)[0].location_state == "active"
+    assert not any(observation.outcome == "unavailable" for observation in rows(factory, SourceObservation))
+
+
 def test_reappearance_waits_for_complete_allowlist(factory):
     adapter = FakeAdapter({"INBOX": (42, {1: message(1)}), "Sent": (42, {})})
     run(adapter, factory, "INBOX", "Sent")
