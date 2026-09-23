@@ -1359,12 +1359,13 @@ class ThreadPersistenceRepository:
         self._require_hex(reconstruction_key, "reconstruction_key")
         predecessors = set(predecessor_ids)
         successors = set(successor_ids)
-        required = {"merge": (2, 1), "split": (1, 2), "repartition": (2, 2)}
+        required = {"merge": (2, 1), "split": (1, 2), "repartition": (2, 2), "correction": (1, 1)}
         if (kind not in required or len(predecessors) != len(predecessor_ids)
                 or len(successors) != len(successor_ids) or predecessors & successors
                 or len(predecessors) < required[kind][0] or len(successors) < required[kind][1]
                 or (kind == "merge" and len(successors) != 1)
-                or (kind == "split" and len(predecessors) != 1)):
+                or (kind == "split" and len(predecessors) != 1)
+                or (kind == "correction" and (len(predecessors) != 1 or len(successors) != 1))):
             raise ValueError("invalid lineage operation shape")
         if not isinstance(provenance, str) or not 1 <= len(provenance) <= 50:
             raise ValueError("bounded lineage provenance required")

@@ -644,6 +644,13 @@ def test_phase3d1_model_schema_names_and_constraints(db_session):
     _constraint_rejects(db_session, ThreadMembershipChange(source_record_id=source_row.id,
         account_scope="imap:one", old_conversation_id=first.id, new_conversation_id=first.id,
         reason="correction", reconstruction_key="a" * 64, replay_key="f" * 64))
+    correction = ThreadLineageOperation(account_scope="imap:one", kind="correction",
+        reconstruction_key="a" * 64, replay_key="1" * 64, provenance="test")
+    db_session.add(correction)
+    db_session.flush()
+    _constraint_rejects(db_session, ThreadLineageOperation(account_scope="imap:one",
+        kind="unsupported", reconstruction_key="a" * 64, replay_key="2" * 64,
+        provenance="test"))
     operation = ThreadLineageOperation(account_scope="imap:one", kind="merge",
         reconstruction_key="a" * 64, replay_key="0" * 64, provenance="test")
     db_session.add(operation)

@@ -2,6 +2,7 @@ from alembic.config import Config
 from alembic import command
 import pytest
 from sqlalchemy import create_engine, inspect, text
+from uuid import uuid4
 
 
 PHASE2B_TABLES = {
@@ -149,5 +150,102 @@ def test_phase3d1_legacy_classification_history_and_downgrade_guard(isolated_tmp
         with engine.connect() as connection:
             assert connection.execute(text("SELECT count(*) FROM thread_membership_change")).scalar_one() == 7
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005"
+    finally:
+        engine.dispose()
+
+
+def _lineage_rows(connection):
+    operations = tuple(tuple(row) for row in connection.execute(text("""
+        SELECT id, created_at, account_scope, kind, reconstruction_key, replay_key, provenance
+        FROM thread_lineage_operation ORDER BY id
+    """)))
+    edges = tuple(tuple(row) for row in connection.execute(text("""
+        SELECT id, created_at, operation_id, predecessor_conversation_id, successor_conversation_id
+        FROM thread_lineage_edge ORDER BY id
+    """)))
+    return operations, edges
+
+
+def _lineage_conversations(connection, count):
+    result = []
+    for _ in range(count):
+        row = connection.execute(text("""
+            INSERT INTO conversation
+            (created_at, provenance, account_scope, stable_key, legacy_status)
+            VALUES ('2026-01-01', 'test', 'imap:one', :stable_key, 'resolved')
+        """), {"stable_key": str(uuid4())})
+        result.append(row.lastrowid)
+    return result
+
+
+def _lineage_operation(connection, kind, key, predecessor_ids, successor_ids):
+    row = connection.execute(text("""
+        INSERT INTO thread_lineage_operation
+        (created_at, account_scope, kind, reconstruction_key, replay_key, provenance)
+        VALUES ('2026-01-01', 'imap:one', :kind, :reconstruction_key, :replay_key, 'test')
+    """), {"kind": kind, "reconstruction_key": "d" * 64, "replay_key": key * 64})
+    for predecessor_id in predecessor_ids:
+        for successor_id in successor_ids:
+            connection.execute(text("""
+                INSERT INTO thread_lineage_edge
+                (created_at, operation_id, predecessor_conversation_id, successor_conversation_id)
+                VALUES ('2026-01-01', :operation_id, :predecessor_id, :successor_id)
+            """), {"operation_id": row.lastrowid, "predecessor_id": predecessor_id,
+                   "successor_id": successor_id})
+    return row.lastrowid
+
+
+def test_phase3d3a_lineage_migration_roundtrip_preserves_rows(isolated_tmp_path):
+    cfg = _config(isolated_tmp_path)
+    command.upgrade(cfg, "0005")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    with engine.begin() as connection:
+        ids = _lineage_conversations(connection, 10)
+        _lineage_operation(connection, "merge", "a", ids[:2], [ids[2]])
+        _lineage_operation(connection, "split", "b", [ids[3]], ids[4:6])
+        _lineage_operation(connection, "repartition", "c", ids[6:8], ids[8:10])
+        before = _lineage_rows(connection)
+    engine.dispose()
+
+    for target in ("0006", "0005", "0006"):
+        if target == "0006":
+            command.upgrade(cfg, target)
+        else:
+            command.downgrade(cfg, target)
+        engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+        try:
+            with engine.connect() as connection:
+                assert _lineage_rows(connection) == before
+                assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == target
+            inspector = inspect(engine)
+            assert "ck_thread_lineage_operation_kind" in {
+                item["name"] for item in inspector.get_check_constraints("thread_lineage_operation")}
+            assert "ix_thread_lineage_operation_scope_time" in {
+                item["name"] for item in inspector.get_indexes("thread_lineage_operation")}
+            assert {"ix_thread_lineage_edge_predecessor", "ix_thread_lineage_edge_successor"} <= {
+                item["name"] for item in inspector.get_indexes("thread_lineage_edge")}
+        finally:
+            engine.dispose()
+
+
+def test_phase3d3a_downgrade_refuses_correction_without_data_loss(isolated_tmp_path):
+    cfg = _config(isolated_tmp_path)
+    command.upgrade(cfg, "0006")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    with engine.begin() as connection:
+        first, second = _lineage_conversations(connection, 2)
+        _lineage_operation(connection, "correction", "a", [first], [second])
+        before = _lineage_rows(connection)
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="downgrade refused"):
+        command.downgrade(cfg, "0005")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    try:
+        with engine.connect() as connection:
+            assert _lineage_rows(connection) == before
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006"
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
     finally:
         engine.dispose()

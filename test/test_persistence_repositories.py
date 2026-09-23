@@ -519,6 +519,69 @@ def test_thread_lineage_merge_split_repartition_and_guards(db_session):
     assert split.id != merge.id
 
 
+def test_thread_lineage_correction_shape_replay_and_scope(db_session):
+    repo = _thread_repo(db_session)
+    rows = [repo.create_resolved_conversation("imap:one", "test") for _ in range(5)]
+    foreign = repo.create_resolved_conversation("imap:other", "test")
+    base = dict(account_scope="imap:one", kind="correction", reconstruction_key="a" * 64)
+    for predecessors, successors in (
+        ([rows[0].id], [rows[1].id, rows[2].id]),
+        ([rows[0].id, rows[1].id], [rows[2].id]),
+        ([rows[0].id, rows[1].id], [rows[2].id, rows[3].id]),
+        ([rows[0].id], [rows[0].id]),
+        ([rows[0].id, rows[0].id], [rows[2].id]),
+    ):
+        with pytest.raises(ValueError, match="invalid lineage operation shape"):
+            repo.record_lineage_operation(**base, predecessor_ids=predecessors,
+                                          successor_ids=successors)
+    with pytest.raises(ValueError, match="same account"):
+        repo.record_lineage_operation(**base, predecessor_ids=[rows[0].id],
+                                      successor_ids=[foreign.id])
+    operation = repo.record_lineage_operation(**base, predecessor_ids=[rows[0].id],
+                                              successor_ids=[rows[1].id])
+    assert operation.kind == "correction"
+    assert rows[0].superseded_at is not None
+    assert [(edge.predecessor_conversation_id, edge.successor_conversation_id)
+            for edge in repo.lineage_from(rows[0].id)] == [(rows[0].id, rows[1].id)]
+    assert repo.record_lineage_operation(**base, predecessor_ids=[rows[0].id],
+                                         successor_ids=[rows[1].id]) is operation
+    operation.provenance = "tampered"
+    with pytest.raises(ValueError, match="payload conflict"):
+        repo.record_lineage_operation(**base, predecessor_ids=[rows[0].id],
+                                      successor_ids=[rows[1].id])
+    operation.provenance = "thread_reconstruction"
+    with pytest.raises(ValueError, match="replay key mismatch"):
+        repo.record_lineage_operation(**base, predecessor_ids=[rows[0].id],
+                                      successor_ids=[rows[1].id], replay_key="f" * 64)
+    with pytest.raises(ValueError, match="already superseded"):
+        repo.record_lineage_operation(**(base | {"reconstruction_key": "b" * 64}),
+                                      predecessor_ids=[rows[0].id], successor_ids=[rows[2].id])
+    rows[3].superseded_at = datetime.now(timezone.utc)
+    with pytest.raises(ValueError, match="already superseded"):
+        repo.record_lineage_operation(**base, predecessor_ids=[rows[3].id],
+                                      successor_ids=[rows[4].id])
+    rows[2].superseded_at = datetime.now(timezone.utc)
+    with pytest.raises(ValueError, match="already superseded"):
+        repo.record_lineage_operation(**base, predecessor_ids=[rows[4].id],
+                                      successor_ids=[rows[2].id])
+
+
+def test_thread_lineage_correction_cycle_guard(db_session):
+    repo = _thread_repo(db_session)
+    first, second = [repo.create_resolved_conversation("imap:one", "test") for _ in range(2)]
+    prior = ThreadLineageOperation(account_scope="imap:one", kind="correction",
+        reconstruction_key="a" * 64, replay_key="b" * 64, provenance="test")
+    db_session.add(prior)
+    db_session.flush()
+    db_session.add(ThreadLineageEdge(operation_id=prior.id,
+        predecessor_conversation_id=second.id, successor_conversation_id=first.id))
+    db_session.flush()
+    with pytest.raises(ValueError, match="lineage cycle"):
+        repo.record_lineage_operation(account_scope="imap:one", kind="correction",
+            predecessor_ids=[first.id], successor_ids=[second.id], reconstruction_key="c" * 64)
+    assert first.superseded_at is None and second.superseded_at is None
+
+
 def test_thread_lineage_cycle_is_rejected_without_mutation(db_session):
     repo = _thread_repo(db_session)
     first, second, third = [repo.create_resolved_conversation("imap:one", "test") for _ in range(3)]
