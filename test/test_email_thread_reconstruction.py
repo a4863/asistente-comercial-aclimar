@@ -4,15 +4,20 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
+from sqlalchemy.orm import Session
 
 from app.persistence.models import (
-    AuditEvent, Conversation, ConversationMembership, EmailMessage, SourceRecord,
+    AuditEvent, Base, Conversation, ConversationMembership, EmailMessage, SourceRecord,
     ThreadEvidence, ThreadEvidenceDecision, ThreadLineageEdge,
     ThreadLineageOperation, ThreadMembershipChange,
 )
+from app.persistence.database import make_session_factory
+from app.persistence.repositories import ThreadPersistenceRepository
+import app.services.email_thread_reconstruction as reconstruction_module
 from app.services.email_thread_reconstruction import (
-    ThreadReconstructionError, reconstruct_account_threads_in_session,
+    ThreadReconstructionError, reconstruct_account_threads,
+    reconstruct_account_threads_in_session,
 )
 
 SCOPE = "imap:test"
@@ -243,3 +248,195 @@ def test_invalid_scope(db_session, scope, code):
     with pytest.raises(ThreadReconstructionError) as raised:
         reconstruct_account_threads_in_session(db_session, scope)
     assert raised.value.code == code
+
+
+@pytest.fixture
+def wrapper_engine(isolated_tmp_path):
+    factory = make_session_factory(f"sqlite:///{isolated_tmp_path / 'thread-wrapper.db'}")
+    engine = factory.kw["bind"]
+    Base.metadata.create_all(engine)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+def _committed_email(engine, name, *, parent=None, old_group=None):
+    with Session(engine) as session:
+        source = _email(session, name, parent=parent)
+        if old_group is not None:
+            _conversation(session, source)
+        session.commit()
+        return source.id
+
+
+def _counts(engine):
+    with Session(engine) as session:
+        return tuple(_count(session, model) for model in (
+            Conversation, ThreadEvidence, ThreadEvidenceDecision,
+            ThreadMembershipChange, ThreadLineageOperation, ThreadLineageEdge, AuditEvent))
+
+
+def test_wrapper_empty_success_and_single_commit(wrapper_engine):
+    commits = []
+    def on_commit(connection):
+        commits.append(connection)
+    event.listen(wrapper_engine, "commit", on_commit)
+    try:
+        result = reconstruct_account_threads(wrapper_engine, SCOPE)
+    finally:
+        event.remove(wrapper_engine, "commit", on_commit)
+    assert result.status == "completed"
+    assert (result.source_count, result.component_count, result.conversations_created,
+            result.memberships_changed, result.lineage_operations_created) == (0, 0, 0, 0, 0)
+    assert len(result.reconstruction_key) == 64
+    assert len(commits) == 1
+    assert _counts(wrapper_engine) == (0,) * 7
+
+
+def test_wrapper_reserves_before_snapshot_and_binds_same_connection(wrapper_engine, monkeypatch):
+    _committed_email(wrapper_engine, "a")
+    statements = []
+    def on_sql(connection, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+    event.listen(wrapper_engine, "before_cursor_execute", on_sql)
+    original = ThreadPersistenceRepository.load_account_thread_snapshot
+    observed = []
+    def snapshot(repo, scope):
+        observed.append((repo.session.connection(), tuple(statements)))
+        return original(repo, scope)
+    monkeypatch.setattr(ThreadPersistenceRepository, "load_account_thread_snapshot", snapshot)
+    try:
+        result = reconstruct_account_threads(wrapper_engine, SCOPE)
+    finally:
+        event.remove(wrapper_engine, "before_cursor_execute", on_sql)
+    assert result.status == "completed" and result.source_count == 1
+    assert len(observed) == 1
+    assert "BEGIN IMMEDIATE" in observed[0][1]
+    assert observed[0][1].index("BEGIN IMMEDIATE") < len(observed[0][1]) - 1
+    assert observed[0][0].engine is wrapper_engine
+    assert _counts(wrapper_engine)[-1] == 0
+
+
+def test_wrapper_exact_replay_has_no_duplicates(wrapper_engine):
+    _committed_email(wrapper_engine, "root")
+    _committed_email(wrapper_engine, "child", parent="root")
+    first = reconstruct_account_threads(wrapper_engine, SCOPE)
+    before = _counts(wrapper_engine)
+    second = reconstruct_account_threads(wrapper_engine, SCOPE)
+    assert first.status == second.status == "completed"
+    assert first.reconstruction_key == second.reconstruction_key
+    assert (second.conversations_created, second.memberships_changed,
+            second.lineage_operations_created) == (0, 0, 0)
+    assert _counts(wrapper_engine) == before
+
+
+@pytest.mark.parametrize("stage", ["append_evidence", "append_decision",
+    "create_resolved_conversation", "record_lineage_operation", "assign_current_membership"])
+def test_wrapper_rolls_back_every_injected_stage(wrapper_engine, monkeypatch, stage):
+    with Session(wrapper_engine) as session:
+        first = _email(session, "first")
+        second = _email(session, "second", parent="first")
+        if stage == "record_lineage_operation":
+            _conversation(session, first)
+            _conversation(session, second)
+        session.commit()
+    before = _counts(wrapper_engine)
+    original = getattr(ThreadPersistenceRepository, stage)
+    calls = []
+    def fail_after_write(repo, *args, **kwargs):
+        result = original(repo, *args, **kwargs)
+        calls.append(1)
+        raise RuntimeError("injected after write")
+    monkeypatch.setattr(ThreadPersistenceRepository, stage, fail_after_write)
+    with pytest.raises(ThreadReconstructionError) as raised:
+        reconstruct_account_threads(wrapper_engine, SCOPE)
+    assert raised.value.code == "persistence_conflict"
+    assert calls == [1]
+    assert _counts(wrapper_engine) == before
+
+
+def test_wrapper_preserves_core_error_and_rolls_back(wrapper_engine, monkeypatch):
+    _committed_email(wrapper_engine, "a")
+    before = _counts(wrapper_engine)
+    def fail(session, scope):
+        session.add(Conversation(account_scope=SCOPE, legacy_status="resolved",
+            stable_key=str(uuid4()), provenance="test"))
+        session.flush()
+        raise ThreadReconstructionError("invalid_partition")
+    monkeypatch.setattr(reconstruction_module, "reconstruct_account_threads_in_session", fail)
+    with pytest.raises(ThreadReconstructionError) as raised:
+        reconstruct_account_threads(wrapper_engine, SCOPE)
+    assert raised.value.code == "invalid_partition"
+    assert _counts(wrapper_engine) == before
+
+
+@pytest.mark.parametrize("busy_attempts", [1, 2, 3])
+def test_wrapper_retries_only_busy_acquisition(wrapper_engine, monkeypatch, busy_attempts):
+    attempts = []
+    waits = []
+    def on_sql(connection, cursor, statement, parameters, context, executemany):
+        if statement == "BEGIN IMMEDIATE":
+            attempts.append(connection)
+            if len(attempts) <= busy_attempts:
+                raise __import__("sqlite3").OperationalError("database is locked")
+    event.listen(wrapper_engine, "before_cursor_execute", on_sql)
+    monkeypatch.setattr(reconstruction_module, "_sleep", waits.append)
+    try:
+        result = reconstruct_account_threads(wrapper_engine, SCOPE)
+    finally:
+        event.remove(wrapper_engine, "before_cursor_execute", on_sql)
+    assert len(attempts) == min(busy_attempts + 1, 3)
+    assert len({id(connection) for connection in attempts}) == len(attempts)
+    assert waits == [0.1] * min(busy_attempts, 2)
+    if busy_attempts == 3:
+        assert (result.status, result.reconstruction_key, result.source_count,
+                result.component_count, result.conversations_created,
+                result.memberships_changed, result.lineage_operations_created) == (
+                "busy_retry_later", None, None, None, 0, 0, 0)
+    else:
+        assert result.status == "completed"
+
+
+def test_wrapper_busy_after_reservation_does_not_retry(wrapper_engine, monkeypatch):
+    attempts = []
+    def on_sql(connection, cursor, statement, parameters, context, executemany):
+        if statement == "BEGIN IMMEDIATE":
+            attempts.append(connection)
+    event.listen(wrapper_engine, "before_cursor_execute", on_sql)
+    monkeypatch.setattr(reconstruction_module, "reconstruct_account_threads_in_session",
+        lambda session, scope: (_ for _ in ()).throw(
+            __import__("sqlite3").OperationalError("database is locked")))
+    try:
+        with pytest.raises(ThreadReconstructionError) as raised:
+            reconstruct_account_threads(wrapper_engine, SCOPE)
+    finally:
+        event.remove(wrapper_engine, "before_cursor_execute", on_sql)
+    assert raised.value.code == "persistence_conflict"
+    assert len(attempts) == 1
+
+
+def test_wrapper_real_concurrent_writer_is_bounded(wrapper_engine, monkeypatch):
+    monkeypatch.setattr(reconstruction_module, "_sleep", lambda seconds: None)
+    with wrapper_engine.connect() as writer:
+        writer.exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            result = reconstruct_account_threads(wrapper_engine, SCOPE)
+        finally:
+            writer.rollback()
+    assert result.status == "busy_retry_later"
+    assert reconstruct_account_threads(wrapper_engine, SCOPE).status == "completed"
+
+
+def test_wrapper_invalid_scope_never_connects(wrapper_engine, monkeypatch):
+    monkeypatch.setattr(wrapper_engine, "connect", lambda: pytest.fail("connected"))
+    with pytest.raises(ThreadReconstructionError) as raised:
+        reconstruct_account_threads(wrapper_engine, " ")
+    assert raised.value.code == "invalid_scope"
+
+
+def test_wrapper_rejects_non_sqlite_engine(wrapper_engine, monkeypatch):
+    monkeypatch.setattr(wrapper_engine.dialect, "name", "postgresql")
+    with pytest.raises(ThreadReconstructionError) as raised:
+        reconstruct_account_threads(wrapper_engine, SCOPE)
+    assert raised.value.code == "persistence_conflict"

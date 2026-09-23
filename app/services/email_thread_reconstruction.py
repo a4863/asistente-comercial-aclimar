@@ -1,8 +1,13 @@
 """Account-wide thread reconstruction inside a caller-owned transaction."""
 
 from dataclasses import dataclass
+import sqlite3
+import time
+from typing import Literal
 
 from sqlalchemy import select
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.domain.email_threading import (
@@ -43,6 +48,90 @@ class ThreadReconstructionCoreResult:
     conversations_created: int
     memberships_changed: int
     lineage_operations_created: int
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadReconstructionResult:
+    account_scope: str
+    status: Literal["completed", "busy_retry_later"]
+    reconstruction_key: str | None
+    source_count: int | None
+    component_count: int | None
+    conversations_created: int
+    memberships_changed: int
+    lineage_operations_created: int
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _acquisition_busy(exc: BaseException) -> bool:
+    original = exc.orig if isinstance(exc, OperationalError) else exc
+    if not isinstance(original, sqlite3.OperationalError):
+        return False
+    code = getattr(original, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    return str(original).lower() in {"database is locked", "database is busy", "database table is locked"}
+
+
+def reconstruct_account_threads(engine: Engine, account_scope: str) -> ThreadReconstructionResult:
+    """Run one atomic account reconstruction with a reserved SQLite writer slot."""
+    if not isinstance(account_scope, str) or not 1 <= len(account_scope) <= 100 or not account_scope.strip():
+        raise ThreadReconstructionError("invalid_scope")
+
+    for attempt in range(3):
+        busy = False
+        try:
+            with engine.connect() as connection:
+                if connection.dialect.name != "sqlite":
+                    raise ThreadReconstructionError("persistence_conflict")
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                if connection.exec_driver_sql("PRAGMA foreign_keys").scalar() != 1:
+                    raise ThreadReconstructionError("persistence_conflict")
+                connection.exec_driver_sql("PRAGMA busy_timeout=0")
+                # PRAGMAs create a SQLAlchemy logical transaction, but no SQLite
+                # write reservation. End it before issuing the explicit BEGIN.
+                connection.rollback()
+                try:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                except (OperationalError, sqlite3.OperationalError) as exc:
+                    connection.rollback()
+                    if not _acquisition_busy(exc):
+                        raise ThreadReconstructionError("persistence_conflict") from None
+                    busy = True
+                if not busy:
+                    session = Session(bind=connection, join_transaction_mode="rollback_only")
+                    try:
+                        # Join the reserved connection without issuing another BEGIN.
+                        session.connection()
+                        core = reconstruct_account_threads_in_session(session, account_scope)
+                        session.flush()
+                        connection.commit()
+                    except ThreadReconstructionError:
+                        connection.rollback()
+                        raise
+                    except Exception:
+                        connection.rollback()
+                        raise ThreadReconstructionError("persistence_conflict") from None
+                    finally:
+                        session.close()
+                    return ThreadReconstructionResult(account_scope, "completed",
+                        core.reconstruction_key, core.source_count, core.component_count,
+                        core.conversations_created, core.memberships_changed,
+                        core.lineage_operations_created)
+        except ThreadReconstructionError:
+            raise
+        except Exception:
+            raise ThreadReconstructionError("persistence_conflict") from None
+        if not busy:
+            raise ThreadReconstructionError("persistence_conflict")
+        if attempt < 2:
+            _sleep(0.1)
+
+    return ThreadReconstructionResult(account_scope, "busy_retry_later",
+        None, None, None, 0, 0, 0)
 
 
 def _snapshot_error(exc: ValueError) -> str:
