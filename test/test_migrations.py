@@ -2,7 +2,10 @@ from alembic.config import Config
 from alembic import command
 import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 from uuid import uuid4
+
+from app.persistence.models import Base
 
 
 PHASE2B_TABLES = {
@@ -26,6 +29,10 @@ PHASE3A_TABLES = {
 PHASE3D1_TABLES = {
     "thread_evidence", "thread_evidence_decision", "thread_membership_change",
     "thread_lineage_operation", "thread_lineage_edge",
+}
+PHASE4_TABLES = {
+    "analysis_run", "analysis_source_evidence", "analysis_derivation_link",
+    "analysis_summary", "analysis_operational_link",
 }
 
 
@@ -245,6 +252,321 @@ def test_phase3d3a_downgrade_refuses_correction_without_data_loss(isolated_tmp_p
     try:
         with engine.connect() as connection:
             assert _lineage_rows(connection) == before
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006"
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        engine.dispose()
+
+
+def _phase4_schema(engine):
+    inspector = inspect(engine)
+    result = {}
+    for table in PHASE4_TABLES | {"commitment"}:
+        result[table] = {
+            "columns": {row["name"]: (str(row["type"]), row["nullable"], row["primary_key"])
+                        for row in inspector.get_columns(table)},
+            "checks": {row["name"]: " ".join(row["sqltext"].split())
+                       for row in inspector.get_check_constraints(table) if row["name"]},
+            "uniques": {tuple(row["column_names"])
+                        for row in inspector.get_unique_constraints(table)},
+            "indexes": {(row["name"], tuple(row["column_names"]), row["unique"],
+                         row["dialect_options"].get("sqlite_where") is not None)
+                        for row in inspector.get_indexes(table)},
+            "fks": {(tuple(row["constrained_columns"]), row["referred_table"],
+                     row["options"].get("ondelete"))
+                    for row in inspector.get_foreign_keys(table)},
+        }
+    return result
+
+
+def _phase4_parent(connection):
+    source_id = connection.execute(text(
+        "INSERT INTO source_record (created_at, source_type, source_system_scope, "
+        "ingested_at, retention_state, manual_entry, provenance) "
+        "VALUES ('2026-01-01', 'email_message', 'imap:one', '2026-01-01', "
+        "'active', 0, 'test')"
+    )).lastrowid
+    conversation_id = connection.execute(text(
+        "INSERT INTO conversation (created_at, provenance, account_scope, stable_key, legacy_status) "
+        "VALUES ('2026-01-01', 'test', 'imap:one', :key, 'resolved')"
+    ), {"key": str(uuid4())}).lastrowid
+    return source_id, conversation_id
+
+
+def _phase4_run(connection, source_id, conversation_id, **overrides):
+    fields = dict(created_at="2026-01-01", updated_at="2026-01-01", account_scope="imap:one",
+                  target_source_record_id=source_id, conversation_id=conversation_id,
+                  run_version=1, input_digest="a" * 64, contract_version=1, policy_version=1,
+                  request_mode="manual", status="reserved", failure_code=None, completed_at=None,
+                  supersedes_run_id=None)
+    fields.update(overrides)
+    columns = ", ".join(fields)
+    parameters = ", ".join(f":{name}" for name in fields)
+    return connection.execute(text(f"INSERT INTO analysis_run ({columns}) VALUES ({parameters})"), fields).lastrowid
+
+
+def _reject_sql(connection, sql, parameters):
+    with pytest.raises(IntegrityError):
+        with connection.begin_nested():
+            connection.execute(text(sql) if isinstance(sql, str) else sql, parameters)
+
+
+def test_phase4a2_upgrade_parity_legacy_and_roundtrip(isolated_tmp_path):
+    cfg = _config(isolated_tmp_path)
+    command.upgrade(cfg, "0006")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    with engine.begin() as connection:
+        legacy_id = connection.execute(text(
+            "INSERT INTO commitment (created_at, description, state, due_at, "
+            "resolution_reference, provenance) VALUES ('2026-01-01', 'legacy', 'confirmed', "
+            "'2026-02-01', 'resolution', 'test')"
+        )).lastrowid
+        original = connection.execute(text("SELECT * FROM commitment WHERE id=:id"), {"id": legacy_id}).mappings().one()
+    engine.dispose()
+
+    command.upgrade(cfg, "0007")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    reference = create_engine("sqlite://")
+    try:
+        Base.metadata.create_all(reference)
+        migrated = _phase4_schema(engine)
+        mapped = _phase4_schema(reference)
+        for table in PHASE4_TABLES:
+            assert migrated[table] == mapped[table]
+        assert migrated["commitment"]["columns"] == mapped["commitment"]["columns"]
+        assert migrated["commitment"]["indexes"] == mapped["commitment"]["indexes"]
+        assert {name: expression for name, expression in migrated["commitment"]["checks"].items()
+                if name.startswith("ck_commitment_") and name != "ck_commitment_state"} == {
+                    name: expression for name, expression in mapped["commitment"]["checks"].items()
+                    if name.startswith("ck_commitment_")
+                }
+        with engine.connect() as connection:
+            current = connection.execute(text("SELECT * FROM commitment WHERE id=:id"), {"id": legacy_id}).mappings().one()
+            assert {key: current[key] for key in original.keys()} == dict(original)
+            assert all(current[key] is None for key in ("responsible_party", "date_certainty", "date_expression"))
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        engine.dispose()
+        reference.dispose()
+
+    command.downgrade(cfg, "0006")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    try:
+        assert PHASE4_TABLES.isdisjoint(inspect(engine).get_table_names())
+        assert {column["name"] for column in inspect(engine).get_columns("commitment")} == set(original)
+        assert "ix_commitment_due_state" in {index["name"] for index in inspect(engine).get_indexes("commitment")}
+        with engine.connect() as connection:
+            assert dict(connection.execute(text("SELECT * FROM commitment WHERE id=:id"), {"id": legacy_id}).mappings().one()) == dict(original)
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        engine.dispose()
+    command.upgrade(cfg, "0007")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    try:
+        assert PHASE4_TABLES <= set(inspect(engine).get_table_names())
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0007"
+    finally:
+        engine.dispose()
+
+
+def test_phase4a2_commitment_checks_and_run_lifecycle(isolated_tmp_path):
+    cfg = _config(isolated_tmp_path)
+    command.upgrade(cfg, "0007")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            due = "2026-02-01"
+            base = dict(created_at="2026-01-01", description="promise", state="detected",
+                        due_at=due, responsible_party="self", date_certainty="exact",
+                        date_expression=None, provenance="test")
+            statement = text(
+                "INSERT INTO commitment (created_at, description, state, due_at, "
+                "responsible_party, date_certainty, date_expression, provenance) "
+                "VALUES (:created_at, :description, :state, :due_at, :responsible_party, "
+                ":date_certainty, :date_expression, :provenance)"
+            )
+            connection.execute(statement, base)
+            connection.execute(statement, base | {"date_certainty": "resolved_relative", "date_expression": "tomorrow"})
+            connection.execute(statement, base | {"date_certainty": "uncertain", "due_at": None})
+            connection.execute(statement, base | {"date_certainty": "none", "due_at": None})
+            for changes in (
+                {"responsible_party": "other"}, {"date_certainty": "invalid"},
+                {"date_certainty": "exact", "due_at": None},
+                {"date_certainty": "resolved_relative", "date_expression": None},
+                {"date_certainty": "uncertain", "due_at": due},
+                {"date_certainty": "none", "due_at": due},
+            ):
+                _reject_sql(connection, statement, base | changes)
+
+            source_id, conversation_id = _phase4_parent(connection)
+            run_id = _phase4_run(connection, source_id, conversation_id)
+            _reject_sql(connection, text(
+                "UPDATE analysis_run SET status='completed' WHERE id=:id"
+            ), {"id": run_id})
+            _reject_sql(connection, text(
+                "UPDATE analysis_run SET status='failed_retryable' WHERE id=:id"
+            ), {"id": run_id})
+            connection.execute(text(
+                "UPDATE analysis_run SET status='completed', completed_at='2026-01-02' WHERE id=:id"
+            ), {"id": run_id})
+            _reject_sql(connection, text(
+                "UPDATE analysis_run SET failure_code='provider_failure' WHERE id=:id"
+            ), {"id": run_id})
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        engine.dispose()
+
+
+def test_phase4a2_child_constraints_and_restrict(isolated_tmp_path):
+    cfg = _config(isolated_tmp_path)
+    command.upgrade(cfg, "0007")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            source_id, conversation_id = _phase4_parent(connection)
+            run_id = _phase4_run(connection, source_id, conversation_id)
+            evidence = dict(created_at="2026-01-01", analysis_run_id=run_id,
+                            source_record_id=source_id, start_offset=0, end_offset=2,
+                            body_digest="b" * 64, span_digest="c" * 64, quote_state="new")
+            evidence_sql = text(
+                "INSERT INTO analysis_source_evidence (created_at, analysis_run_id, source_record_id, "
+                "start_offset, end_offset, body_digest, span_digest, quote_state) VALUES "
+                "(:created_at, :analysis_run_id, :source_record_id, :start_offset, :end_offset, "
+                ":body_digest, :span_digest, :quote_state)"
+            )
+            evidence_id = connection.execute(evidence_sql, evidence).lastrowid
+            for change in ({"end_offset": 0}, {"quote_state": "invalid"}, {"span_digest": "bad"}, {}):
+                _reject_sql(connection, evidence_sql, evidence | change)
+            fact_id = connection.execute(text(
+                "INSERT INTO extracted_fact (created_at, fact_type, value_reference, provenance) "
+                "VALUES ('2026-01-01', 'question', '?', 'test')"
+            )).lastrowid
+            link_sql = text(
+                "INSERT INTO analysis_derivation_link (created_at, analysis_run_id, extracted_fact_id, "
+                "inference_id, evidence_id) VALUES ('2026-01-01', :run_id, :fact_id, :inference_id, :evidence_id)"
+            )
+            link_id = connection.execute(link_sql, {"run_id": run_id, "fact_id": fact_id,
+                                                    "inference_id": None, "evidence_id": evidence_id}).lastrowid
+            _reject_sql(connection, link_sql, {"run_id": run_id, "fact_id": None,
+                                               "inference_id": None, "evidence_id": evidence_id})
+            _reject_sql(connection, link_sql, {"run_id": run_id, "fact_id": fact_id,
+                                               "inference_id": None, "evidence_id": evidence_id})
+            summary_sql = text(
+                "INSERT INTO analysis_summary (created_at, analysis_run_id, summary_text, summary_digest) "
+                "VALUES ('2026-01-01', :run_id, :summary, :digest)"
+            )
+            _reject_sql(connection, summary_sql, {"run_id": run_id, "summary": "", "digest": "d" * 64})
+            _reject_sql(connection, summary_sql, {"run_id": run_id, "summary": "x" * 4001, "digest": "d" * 64})
+            connection.execute(summary_sql, {"run_id": run_id, "summary": "derived", "digest": "d" * 64})
+            question_id = connection.execute(text(
+                "INSERT INTO question (created_at, question_text, state, provenance) "
+                "VALUES ('2026-01-01', '?', 'detected', 'test')"
+            )).lastrowid
+            op_sql = text(
+                "INSERT INTO analysis_operational_link (created_at, analysis_run_id, derivation_link_id, "
+                "operational_type, question_id) VALUES ('2026-01-01', :run_id, :link_id, :kind, :question_id)"
+            )
+            connection.execute(op_sql, {"run_id": run_id, "link_id": link_id,
+                                        "kind": "question", "question_id": question_id})
+            _reject_sql(connection, op_sql, {"run_id": run_id, "link_id": link_id,
+                                         "kind": "task", "question_id": question_id})
+            _reject_sql(connection, op_sql, {"run_id": run_id, "link_id": link_id,
+                                         "kind": "question", "question_id": question_id})
+            _reject_sql(connection, text("DELETE FROM analysis_run WHERE id=:id"), {"id": run_id})
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("kind", ["analysis_run", "analysis_source_evidence", "analysis_derivation_link", "analysis_summary", "analysis_operational_link", "commitment"])
+def test_phase4a2_downgrade_refuses_all_data_without_loss(isolated_tmp_path, kind):
+    cfg = _config(isolated_tmp_path)
+    command.upgrade(cfg, "0007")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        source_id, conversation_id = _phase4_parent(connection)
+        if kind == "commitment":
+            connection.execute(text(
+                "INSERT INTO commitment (created_at, description, state, provenance, "
+                "responsible_party, date_certainty) VALUES "
+                "('2026-01-01', 'promise', 'detected', 'test', 'self', 'none')"
+            ))
+        elif kind == "analysis_run":
+            _phase4_run(connection, source_id, conversation_id)
+        else:
+            # With FK enforcement, a child necessarily has an AnalysisRun parent.
+            run_id = _phase4_run(connection, source_id, conversation_id)
+            if kind == "analysis_source_evidence":
+                connection.execute(text(
+                    "INSERT INTO analysis_source_evidence (created_at, analysis_run_id, source_record_id, "
+                    "start_offset, end_offset, body_digest, span_digest, quote_state) VALUES "
+                    "('2026-01-01', :run_id, :source_id, 0, 1, :digest, :digest, 'new')"
+                ), {"run_id": run_id, "source_id": source_id, "digest": "a" * 64})
+            elif kind == "analysis_summary":
+                connection.execute(text(
+                    "INSERT INTO analysis_summary (created_at, analysis_run_id, summary_text, summary_digest) "
+                    "VALUES ('2026-01-01', :run_id, 'derived', :digest)"
+                ), {"run_id": run_id, "digest": "a" * 64})
+            else:
+                fact_id = connection.execute(text(
+                    "INSERT INTO extracted_fact (created_at, fact_type, value_reference, provenance) "
+                    "VALUES ('2026-01-01', 'question', '?', 'test')"
+                )).lastrowid
+                link_id = connection.execute(text(
+                    "INSERT INTO analysis_derivation_link (created_at, analysis_run_id, extracted_fact_id) "
+                    "VALUES ('2026-01-01', :run_id, :fact_id)"
+                ), {"run_id": run_id, "fact_id": fact_id}).lastrowid
+                if kind == "analysis_operational_link":
+                    question_id = connection.execute(text(
+                        "INSERT INTO question (created_at, question_text, state, provenance) "
+                        "VALUES ('2026-01-01', '?', 'detected', 'test')"
+                    )).lastrowid
+                    connection.execute(text(
+                        "INSERT INTO analysis_operational_link (created_at, analysis_run_id, "
+                        "derivation_link_id, operational_type, question_id) VALUES "
+                        "('2026-01-01', :run_id, :link_id, 'question', :question_id)"
+                    ), {"run_id": run_id, "link_id": link_id, "question_id": question_id})
+        before = {table: connection.execute(text(f"SELECT count(*) FROM {table}")).scalar_one()
+                  for table in PHASE4_TABLES | {"commitment"}}
+    engine.dispose()
+    with pytest.raises(RuntimeError, match="downgrade refused"):
+        command.downgrade(cfg, "0006")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    try:
+        assert PHASE4_TABLES <= set(inspect(engine).get_table_names())
+        with engine.connect() as connection:
+            assert {table: connection.execute(text(f"SELECT count(*) FROM {table}")).scalar_one()
+                    for table in before} == before
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0007"
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        engine.dispose()
+
+
+def test_phase4a2_upgrade_failure_rolls_back_schema(isolated_tmp_path, monkeypatch):
+    from alembic.operations import Operations
+
+    cfg = _config(isolated_tmp_path)
+    command.upgrade(cfg, "0006")
+    original = Operations.create_table
+
+    def fail_after_first(self, table_name, *args, **kwargs):
+        if table_name == "analysis_source_evidence":
+            raise RuntimeError("synthetic migration failure")
+        return original(self, table_name, *args, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Operations, "create_table", fail_after_first)
+        with pytest.raises(RuntimeError, match="synthetic migration failure"):
+            command.upgrade(cfg, "0007")
+    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    try:
+        assert PHASE4_TABLES.isdisjoint(inspect(engine).get_table_names())
+        with engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006"
             assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
     finally:
