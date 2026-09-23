@@ -181,7 +181,8 @@ def calculate_source_revision(message: EmailThreadInput) -> str:
 
 
 def _validated(account_scope: str, messages: tuple[EmailThreadInput, ...]) -> tuple[EmailThreadInput, ...]:
-    if not isinstance(account_scope, str) or not account_scope or len(account_scope) > 100:
+    if (not isinstance(account_scope, str) or not account_scope.strip()
+            or len(account_scope) > 100):
         raise ValueError("invalid account_scope")
     if not isinstance(messages, tuple):
         raise ValueError("messages must be a tuple")
