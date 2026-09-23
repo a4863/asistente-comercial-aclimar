@@ -517,6 +517,12 @@ def test_account_thread_snapshot_full_members_and_deterministic_order(db_session
     assert rows[1].current_conversation_id is None
     assert rows[0].full_current_member_ids == tuple(sorted((first.id, excluded.id, other.id, last.id)))
     assert rows[2].full_current_member_ids == rows[0].full_current_member_ids
+    assert tuple(member.source_record_id for member in rows[0].full_current_members) == rows[0].full_current_member_ids
+    member_by_id = {member.source_record_id: member for member in rows[0].full_current_members}
+    assert member_by_id[other.id].source_type == "manual_note"
+    assert member_by_id[other.id].account_scope == "manual"
+    assert member_by_id[excluded.id].source_type == "email_message"
+    assert member_by_id[excluded.id].account_scope == "imap:one"
     assert foreign.id not in [row.source_record_id for row in rows]
 
 
