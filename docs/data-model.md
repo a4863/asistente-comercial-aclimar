@@ -100,6 +100,16 @@ These are distinct first-class concepts.
 
 All three may be related to activities, CRM context links, tasks, commitments, questions, next steps, and alerts. They must never collapse into a single undifferentiated factual record.
 
+### Phase 4 email-analysis foundation
+
+`AnalysisRun` identifies one bounded analysis attempt for a target email in its current account-scoped conversation. It records the target source, conversation, positive run version, canonical input digest, positive contract/policy versions, request mode (`automatic`, `manual`, `force`), status (`reserved`, `completed`, `stale_retryable`, `failed_retryable`), bounded failure reason when retryable, timestamps, and an optional predecessor completed run. A completed run has a completion timestamp and no failure reason; a reserved run has neither; retryable runs have a bounded failure reason and no completion timestamp. Version is unique for the account and target. Normal same-input replay reuses the current completed result without duplicating records; explicit force appends a new version. Supersession links completed versions instead of deleting prior derivations.
+
+`AnalysisSourceEvidence` anchors an analysis claim to one source's original locally stored email body. It records source and run identities, a 0-based half-open start/end span, full-body and span digests, and `new`, `quoted`, or `ambiguous` quote status. It stores neither an email-body copy nor an attachment body. The application validates the coordinates and text against the original body. An ambiguous or historical quoted question cannot automatically become a newly asked current question.
+
+`AnalysisDerivationLink` ties a run to exactly one `ExtractedFact`, `Inference`, or `Proposal`, with optional source-local evidence. Existing fact-source and inference/proposal support relationships remain distinct. `AnalysisSummary` is a separate run-linked, derived text artifact of 1–4,000 characters and a digest, not a long `value_reference` or raw email-body copy. `AnalysisOperationalLink` ties a run and derivation to exactly one Question, Commitment, Task, or NextStep. Its origin is unique per operational object. The object's analytical provenance is current only while its originating completed run is the target's current completed analysis; a later completed successor makes the older origin `superseded_analysis_needs_review` without changing the object's operational lifecycle.
+
+These Phase 4 structures are the model foundation only. They do not yet imply a migration, an active analysis service, a concrete AI provider, CRM access, or an external action.
+
 ## 8. Internal operational objects
 
 ### Task
@@ -111,6 +121,8 @@ Lifecycle: `proposed → pending → completed | cancelled`. The assistant may c
 ### Commitment
 
 Represents a promise or agreed action by Alejandro or another participant. Main attributes include logical identity, responsible participant context, due date when confirmed, current lifecycle state, provenance, and supporting records.
+
+For new Phase 4 commitments, `responsible_party` is `self`, `counterparty`, or `unknown`; `date_certainty` is `exact`, `resolved_relative`, `uncertain`, or `none`; and optional `date_expression` retains relative wording (at most 255 characters). `exact` requires a resolved due date; `resolved_relative` requires both due date and expression; `uncertain` and `none` have no resolved due date. Without a reliable source-message date, relative wording stays uncertain and ingestion time is not substituted. Legacy commitments retain null new fields without fabricated backfill.
 
 Lifecycle: `detected → confirmed → fulfilled | overdue | cancelled`. A confirmed commitment may become overdue automatically when its confirmed due date passes. Fulfilment requires explicit later source evidence or user confirmation.
 

@@ -8,6 +8,11 @@ from sqlalchemy.exc import IntegrityError
 from app.persistence.models import (
     ActionProposal,
     Alert,
+    AnalysisDerivationLink,
+    AnalysisOperationalLink,
+    AnalysisRun,
+    AnalysisSourceEvidence,
+    AnalysisSummary,
     ApprovalDecision,
     CRMContextLink,
     CRMReference,
@@ -770,3 +775,241 @@ def test_email_schema_contains_no_raw_mime_or_attachment_bytes():
     prohibited = {"raw_mime", "raw_html", "attachment_bytes", "content_bytes", "blob"}
     assert prohibited.isdisjoint(email_columns)
     assert prohibited.isdisjoint(attachment_columns)
+
+
+def _analysis_parent(db_session):
+    record = _email_source(db_session, f"analysis-{uuid4()}")
+    conversation = Conversation(
+        account_scope="imap:account", stable_key=str(uuid4()),
+        legacy_status="resolved", provenance="test",
+    )
+    db_session.add(conversation)
+    db_session.flush()
+    return record, conversation
+
+
+def _analysis_run(db_session, **overrides):
+    record, conversation = _analysis_parent(db_session)
+    values = dict(
+        account_scope="imap:account", target_source_record_id=record.id,
+        conversation_id=conversation.id, run_version=1, input_digest="a" * 64,
+        contract_version=1, policy_version=1, request_mode="automatic",
+        status="reserved",
+    )
+    values.update(overrides)
+    run = AnalysisRun(**values)
+    db_session.add(run)
+    db_session.flush()
+    return run, record, conversation
+
+
+def test_phase4a1_schema_columns_indexes_and_restrict_fks(db_session):
+    inspector = inspect(db_session.bind)
+    expected = {
+        "analysis_run": {"account_scope", "target_source_record_id", "conversation_id", "run_version", "input_digest", "contract_version", "policy_version", "request_mode", "status", "failure_code", "supersedes_run_id", "completed_at", "updated_at"},
+        "analysis_source_evidence": {"analysis_run_id", "source_record_id", "start_offset", "end_offset", "body_digest", "span_digest", "quote_state"},
+        "analysis_derivation_link": {"analysis_run_id", "extracted_fact_id", "inference_id", "proposal_id", "evidence_id"},
+        "analysis_summary": {"analysis_run_id", "summary_text", "summary_digest"},
+        "analysis_operational_link": {"analysis_run_id", "derivation_link_id", "operational_type", "question_id", "commitment_id", "task_id", "next_step_id"},
+    }
+    for table, columns in expected.items():
+        actual = {column["name"] for column in inspector.get_columns(table)}
+        assert actual == columns | {"id", "created_at"}
+        assert all(fk["options"].get("ondelete") == "RESTRICT" for fk in inspector.get_foreign_keys(table))
+    commitment_columns = {column["name"] for column in inspector.get_columns("commitment")}
+    assert {"responsible_party", "date_certainty", "date_expression"} <= commitment_columns
+    assert "uq_analysis_run_target_version" in {constraint["name"] for constraint in inspector.get_unique_constraints("analysis_run")}
+    assert "uq_analysis_run_supersedes" in {constraint["name"] for constraint in inspector.get_unique_constraints("analysis_run")}
+    assert "ix_analysis_run_replay" in {index["name"] for index in inspector.get_indexes("analysis_run")}
+    assert "uq_analysis_evidence_span" in {constraint["name"] for constraint in inspector.get_unique_constraints("analysis_source_evidence")}
+    for table in ("analysis_derivation_link", "analysis_operational_link"):
+        assert len([index for index in inspector.get_indexes(table) if index["name"].startswith("uq_analysis_") and index["unique"]]) >= 3
+    assert "raw_body" not in {column["name"] for column in inspector.get_columns("analysis_summary")}
+
+
+@pytest.mark.parametrize(
+    ("status", "completed_at", "failure_code"),
+    [
+        ("reserved", None, None),
+        ("completed", datetime.now(timezone.utc), None),
+        ("stale_retryable", None, "input_changed"),
+        ("failed_retryable", None, "provider_failure"),
+    ],
+)
+def test_phase4a1_valid_run_states(db_session, status, completed_at, failure_code):
+    _analysis_run(db_session, status=status, completed_at=completed_at, failure_code=failure_code)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"request_mode": "unknown"},
+        {"status": "unknown"},
+        {"status": "completed"},
+        {"status": "completed", "completed_at": datetime.now(timezone.utc), "failure_code": "provider_failure"},
+        {"completed_at": datetime.now(timezone.utc)},
+        {"failure_code": "provider_failure"},
+        {"status": "stale_retryable"},
+        {"status": "failed_retryable", "completed_at": datetime.now(timezone.utc), "failure_code": "invalid_output"},
+        {"status": "failed_retryable", "failure_code": "unbounded"},
+        {"input_digest": "A" * 64},
+        {"input_digest": "a" * 63},
+        {"input_digest": "g" * 64},
+        {"run_version": 0},
+        {"contract_version": 0},
+        {"policy_version": -1},
+    ],
+)
+def test_phase4a1_invalid_run_shape(db_session, overrides):
+    record, conversation = _analysis_parent(db_session)
+    values = dict(account_scope="imap:account", target_source_record_id=record.id,
+                  conversation_id=conversation.id, run_version=1, input_digest="a" * 64,
+                  contract_version=1, policy_version=1, request_mode="manual", status="reserved")
+    values.update(overrides)
+    _constraint_rejects(db_session, AnalysisRun(**values))
+
+
+def test_phase4a1_run_version_and_supersession_constraints(db_session):
+    run, record, conversation = _analysis_run(db_session, status="completed", completed_at=datetime.now(timezone.utc))
+    same_target = dict(account_scope=run.account_scope, target_source_record_id=record.id,
+                       conversation_id=conversation.id, input_digest="b" * 64,
+                       contract_version=1, policy_version=1, request_mode="force",
+                       status="completed", completed_at=datetime.now(timezone.utc))
+    _constraint_rejects(db_session, AnalysisRun(**same_target, run_version=1))
+    second = AnalysisRun(**same_target, run_version=2, supersedes_run_id=run.id)
+    db_session.add(second)
+    db_session.flush()
+    _constraint_rejects(db_session, AnalysisRun(**same_target, run_version=3, supersedes_run_id=run.id))
+    second.supersedes_run_id = second.id
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
+def test_phase4a1_evidence_spans_and_quote_constraints(db_session):
+    run, record, _ = _analysis_run(db_session)
+    values = dict(analysis_run_id=run.id, source_record_id=record.id,
+                  start_offset=0, end_offset=4, body_digest="b" * 64,
+                  span_digest="c" * 64, quote_state="new")
+    db_session.add(AnalysisSourceEvidence(**values))
+    db_session.flush()
+    for change in ({"start_offset": -1}, {"end_offset": 0}, {"quote_state": "unknown"},
+                   {"span_digest": "C" * 64}, {"body_digest": "short"}, {}):
+        _constraint_rejects(db_session, AnalysisSourceEvidence(**(values | change)))
+    db_session.add(AnalysisSourceEvidence(**(values | {"start_offset": 5, "end_offset": 9,
+                                                    "quote_state": "quoted"})))
+    db_session.add(AnalysisSourceEvidence(**(values | {"start_offset": 10, "end_offset": 14,
+                                                    "quote_state": "ambiguous"})))
+    db_session.flush()
+
+
+def test_phase4a1_derivation_exactly_one_and_unique(db_session):
+    run, _, _ = _analysis_run(db_session)
+    fact = ExtractedFact(fact_type="question", value_reference="x", provenance="test")
+    inference = Inference(inference_type="risk", value_reference="low", provenance="test")
+    db_session.add_all([fact, inference])
+    db_session.flush()
+    db_session.add(AnalysisDerivationLink(analysis_run_id=run.id, extracted_fact_id=fact.id))
+    db_session.flush()
+    _constraint_rejects(db_session, AnalysisDerivationLink(analysis_run_id=run.id))
+    _constraint_rejects(db_session, AnalysisDerivationLink(analysis_run_id=run.id,
+                                                          extracted_fact_id=fact.id, inference_id=inference.id))
+    _constraint_rejects(db_session, AnalysisDerivationLink(analysis_run_id=run.id,
+                                                          extracted_fact_id=fact.id))
+    db_session.add(AnalysisDerivationLink(analysis_run_id=run.id, inference_id=inference.id))
+    db_session.flush()
+
+
+@pytest.mark.parametrize("summary", ["", "x" * 4001])
+def test_phase4a1_summary_length_rejected(db_session, summary):
+    run, _, _ = _analysis_run(db_session)
+    _constraint_rejects(db_session, AnalysisSummary(analysis_run_id=run.id,
+                                                    summary_text=summary, summary_digest="d" * 64))
+
+
+def test_phase4a1_summary_limit_and_one_per_run(db_session):
+    run, _, _ = _analysis_run(db_session)
+    db_session.add(AnalysisSummary(analysis_run_id=run.id, summary_text="x" * 4000,
+                                   summary_digest="d" * 64))
+    db_session.flush()
+    _constraint_rejects(db_session, AnalysisSummary(analysis_run_id=run.id,
+                                                    summary_text="other", summary_digest="e" * 64))
+    _constraint_rejects(db_session, AnalysisSummary(analysis_run_id=run.id,
+                                                    summary_text="short", summary_digest="D" * 64))
+
+
+def test_phase4a1_operational_link_type_target_and_uniqueness(db_session):
+    run, _, _ = _analysis_run(db_session)
+    fact = ExtractedFact(fact_type="question", value_reference="?", provenance="test")
+    question = Question(question_text="?", provenance="test")
+    db_session.add_all([fact, question])
+    db_session.flush()
+    derivation = AnalysisDerivationLink(analysis_run_id=run.id, extracted_fact_id=fact.id)
+    db_session.add(derivation)
+    db_session.flush()
+    base = dict(analysis_run_id=run.id, derivation_link_id=derivation.id,
+                operational_type="question", question_id=question.id)
+    db_session.add(AnalysisOperationalLink(**base))
+    db_session.flush()
+    _constraint_rejects(db_session, AnalysisOperationalLink(**base))
+    _constraint_rejects(db_session, AnalysisOperationalLink(**(base | {"operational_type": "task"})))
+    _constraint_rejects(db_session, AnalysisOperationalLink(**(base | {"operational_type": "other"})))
+
+
+@pytest.mark.parametrize("responsible_party", ["self", "counterparty", "unknown"])
+def test_phase4a1_valid_commitment_responsibility(db_session, responsible_party):
+    db_session.add(Commitment(description="promise", state="detected", provenance="test",
+                              responsible_party=responsible_party, date_certainty="none"))
+    db_session.flush()
+
+
+@pytest.mark.parametrize(
+    ("certainty", "due", "expression", "valid"),
+    [
+        ("exact", datetime.now(timezone.utc), None, True),
+        ("exact", None, None, False),
+        ("resolved_relative", datetime.now(timezone.utc), "tomorrow", True),
+        ("resolved_relative", None, "tomorrow", False),
+        ("resolved_relative", datetime.now(timezone.utc), None, False),
+        ("uncertain", None, "tomorrow", True),
+        ("uncertain", datetime.now(timezone.utc), "tomorrow", False),
+        ("none", None, None, True),
+        ("none", datetime.now(timezone.utc), None, False),
+        ("invalid", None, None, False),
+    ],
+)
+def test_phase4a1_commitment_date_rules(db_session, certainty, due, expression, valid):
+    row = Commitment(description="promise", state="detected", provenance="test",
+                     responsible_party="self", date_certainty=certainty,
+                     due_at=due, date_expression=expression)
+    if valid:
+        db_session.add(row)
+        db_session.flush()
+    else:
+        _constraint_rejects(db_session, row)
+
+
+def test_phase4a1_legacy_commitment_and_invalid_phase4_fields(db_session):
+    db_session.add(Commitment(description="legacy", state="detected", provenance="test",
+                              due_at=datetime.now(timezone.utc)))
+    db_session.flush()
+    _constraint_rejects(db_session, Commitment(description="bad", state="detected", provenance="test",
+                                               responsible_party="other", date_certainty="none"))
+    _constraint_rejects(db_session, Commitment(description="bad", state="detected", provenance="test",
+                                               responsible_party="self", date_certainty=None))
+    _constraint_rejects(db_session, Commitment(description="bad", state="detected", provenance="test",
+                                               responsible_party="self", date_certainty="uncertain",
+                                               date_expression="x" * 256))
+
+
+def test_phase4a1_restrict_preserves_run_history(db_session):
+    db_session.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
+    run, _, _ = _analysis_run(db_session)
+    evidence = AnalysisSourceEvidence(analysis_run_id=run.id, source_record_id=run.target_source_record_id,
+                                      start_offset=0, end_offset=1, body_digest="b" * 64,
+                                      span_digest="c" * 64, quote_state="new")
+    db_session.add(evidence)
+    db_session.flush()
+    with pytest.raises(IntegrityError):
+        with db_session.begin_nested():
+            db_session.delete(run)
+            db_session.flush()

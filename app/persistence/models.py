@@ -174,10 +174,20 @@ Commitment = _model(
     Column("description", String(255), nullable=False),
     Column("state", String(20), default="detected", nullable=False),
     Column("due_at", DateTime(timezone=True)),
+    Column("responsible_party", String(16)),
+    Column("date_certainty", String(20)),
+    Column("date_expression", String(255)),
     Column("resolution_reference", String(255)),
     Column("provenance", String(255), nullable=False),
     table_args=(
         CheckConstraint("state IN ('detected', 'confirmed', 'fulfilled', 'overdue', 'cancelled')"),
+        CheckConstraint("responsible_party IS NULL OR responsible_party IN ('self', 'counterparty', 'unknown')", name="ck_commitment_responsible_party"),
+        CheckConstraint("date_certainty IS NULL OR date_certainty IN ('exact', 'resolved_relative', 'uncertain', 'none')", name="ck_commitment_date_certainty"),
+        CheckConstraint("date_expression IS NULL OR length(date_expression) <= 255", name="ck_commitment_date_expression"),
+        CheckConstraint("(responsible_party IS NULL AND date_certainty IS NULL AND date_expression IS NULL) OR (responsible_party IS NOT NULL AND date_certainty IS NOT NULL)", name="ck_commitment_phase4_fields"),
+        CheckConstraint("date_certainty IS NULL OR date_certainty NOT IN ('exact', 'resolved_relative') OR due_at IS NOT NULL", name="ck_commitment_dated_due"),
+        CheckConstraint("date_certainty != 'resolved_relative' OR date_expression IS NOT NULL", name="ck_commitment_relative_expression"),
+        CheckConstraint("date_certainty IS NULL OR date_certainty NOT IN ('uncertain', 'none') OR due_at IS NULL", name="ck_commitment_undated_due"),
         Index("ix_commitment_due_state", "state", "due_at"),
     ),
 )
@@ -395,5 +405,101 @@ EmailAttachmentMetadata = _model(
         CheckConstraint("part_index >= 0"),
         CheckConstraint("byte_size IS NULL OR byte_size >= 0"),
         UniqueConstraint("email_message_id", "part_index"),
+    ),
+)
+
+
+AnalysisRun = _model(
+    "AnalysisRun", "analysis_run",
+    Column("account_scope", String(100), nullable=False),
+    Column("target_source_record_id", Integer, ForeignKey("source_record.id", ondelete="RESTRICT"), nullable=False),
+    Column("conversation_id", Integer, ForeignKey("conversation.id", ondelete="RESTRICT"), nullable=False),
+    Column("run_version", Integer, nullable=False),
+    Column("input_digest", String(64), nullable=False),
+    Column("contract_version", Integer, nullable=False),
+    Column("policy_version", Integer, nullable=False),
+    Column("request_mode", String(12), nullable=False),
+    Column("status", String(20), nullable=False),
+    Column("failure_code", String(32)),
+    Column("supersedes_run_id", Integer, ForeignKey("analysis_run.id", ondelete="RESTRICT")),
+    Column("completed_at", DateTime(timezone=True)),
+    Column("updated_at", DateTime(timezone=True), default=utcnow, nullable=False),
+    table_args=(
+        CheckConstraint("length(account_scope) BETWEEN 1 AND 100", name="ck_analysis_run_scope"),
+        CheckConstraint("run_version > 0 AND contract_version > 0 AND policy_version > 0", name="ck_analysis_run_versions"),
+        CheckConstraint(_HEX64.format("input_digest"), name="ck_analysis_run_digest"),
+        CheckConstraint("request_mode IN ('automatic', 'manual', 'force')", name="ck_analysis_run_request_mode"),
+        CheckConstraint("status IN ('reserved', 'completed', 'stale_retryable', 'failed_retryable')", name="ck_analysis_run_status"),
+        CheckConstraint("failure_code IS NULL OR failure_code IN ('input_changed', 'provider_failure', 'invalid_output', 'persistence_failure', 'interrupted')", name="ck_analysis_run_failure_code"),
+        CheckConstraint("(status = 'completed' AND completed_at IS NOT NULL AND failure_code IS NULL) OR (status = 'reserved' AND completed_at IS NULL AND failure_code IS NULL) OR (status IN ('stale_retryable', 'failed_retryable') AND completed_at IS NULL AND failure_code IS NOT NULL)", name="ck_analysis_run_lifecycle"),
+        CheckConstraint("supersedes_run_id IS NULL OR supersedes_run_id != id", name="ck_analysis_run_nonself"),
+        UniqueConstraint("account_scope", "target_source_record_id", "run_version", name="uq_analysis_run_target_version"),
+        UniqueConstraint("supersedes_run_id", name="uq_analysis_run_supersedes"),
+        Index("ix_analysis_run_target_status_version", "account_scope", "target_source_record_id", "status", "run_version"),
+        Index("ix_analysis_run_replay", "target_source_record_id", "input_digest", "contract_version", "policy_version", "status"),
+    ),
+)
+
+AnalysisSourceEvidence = _model(
+    "AnalysisSourceEvidence", "analysis_source_evidence",
+    Column("analysis_run_id", Integer, ForeignKey("analysis_run.id", ondelete="RESTRICT"), nullable=False),
+    Column("source_record_id", Integer, ForeignKey("source_record.id", ondelete="RESTRICT"), nullable=False),
+    Column("start_offset", Integer, nullable=False),
+    Column("end_offset", Integer, nullable=False),
+    Column("body_digest", String(64), nullable=False),
+    Column("span_digest", String(64), nullable=False),
+    Column("quote_state", String(12), nullable=False),
+    table_args=(
+        CheckConstraint("start_offset >= 0 AND end_offset > start_offset", name="ck_analysis_evidence_offsets"),
+        CheckConstraint(_HEX64.format("body_digest") + " AND " + _HEX64.format("span_digest"), name="ck_analysis_evidence_digests"),
+        CheckConstraint("quote_state IN ('new', 'quoted', 'ambiguous')", name="ck_analysis_evidence_quote_state"),
+        UniqueConstraint("analysis_run_id", "source_record_id", "start_offset", "end_offset", "span_digest", name="uq_analysis_evidence_span"),
+        Index("ix_analysis_evidence_source_body", "source_record_id", "body_digest"),
+    ),
+)
+
+AnalysisDerivationLink = _model(
+    "AnalysisDerivationLink", "analysis_derivation_link",
+    Column("analysis_run_id", Integer, ForeignKey("analysis_run.id", ondelete="RESTRICT"), nullable=False),
+    Column("extracted_fact_id", Integer, ForeignKey("extracted_fact.id", ondelete="RESTRICT")),
+    Column("inference_id", Integer, ForeignKey("inference.id", ondelete="RESTRICT")),
+    Column("proposal_id", Integer, ForeignKey("proposal.id", ondelete="RESTRICT")),
+    Column("evidence_id", Integer, ForeignKey("analysis_source_evidence.id", ondelete="RESTRICT")),
+    table_args=(
+        CheckConstraint("(extracted_fact_id IS NOT NULL) + (inference_id IS NOT NULL) + (proposal_id IS NOT NULL) = 1", name="ck_analysis_derivation_exactly_one"),
+        Index("uq_analysis_derivation_fact", "analysis_run_id", "extracted_fact_id", unique=True, sqlite_where=text("extracted_fact_id IS NOT NULL")),
+        Index("uq_analysis_derivation_inference", "analysis_run_id", "inference_id", unique=True, sqlite_where=text("inference_id IS NOT NULL")),
+        Index("uq_analysis_derivation_proposal", "analysis_run_id", "proposal_id", unique=True, sqlite_where=text("proposal_id IS NOT NULL")),
+        Index("ix_analysis_derivation_run", "analysis_run_id", "id"),
+    ),
+)
+
+AnalysisSummary = _model(
+    "AnalysisSummary", "analysis_summary",
+    Column("analysis_run_id", Integer, ForeignKey("analysis_run.id", ondelete="RESTRICT"), nullable=False, unique=True),
+    Column("summary_text", Text, nullable=False),
+    Column("summary_digest", String(64), nullable=False),
+    table_args=(
+        CheckConstraint("length(summary_text) BETWEEN 1 AND 4000", name="ck_analysis_summary_length"),
+        CheckConstraint(_HEX64.format("summary_digest"), name="ck_analysis_summary_digest"),
+    ),
+)
+
+AnalysisOperationalLink = _model(
+    "AnalysisOperationalLink", "analysis_operational_link",
+    Column("analysis_run_id", Integer, ForeignKey("analysis_run.id", ondelete="RESTRICT"), nullable=False),
+    Column("derivation_link_id", Integer, ForeignKey("analysis_derivation_link.id", ondelete="RESTRICT"), nullable=False),
+    Column("operational_type", String(20), nullable=False),
+    Column("question_id", Integer, ForeignKey("question.id", ondelete="RESTRICT")),
+    Column("commitment_id", Integer, ForeignKey("commitment.id", ondelete="RESTRICT")),
+    Column("task_id", Integer, ForeignKey("task.id", ondelete="RESTRICT")),
+    Column("next_step_id", Integer, ForeignKey("next_step.id", ondelete="RESTRICT")),
+    table_args=(
+        CheckConstraint("(operational_type = 'question' AND question_id IS NOT NULL AND commitment_id IS NULL AND task_id IS NULL AND next_step_id IS NULL) OR (operational_type = 'commitment' AND question_id IS NULL AND commitment_id IS NOT NULL AND task_id IS NULL AND next_step_id IS NULL) OR (operational_type = 'task' AND question_id IS NULL AND commitment_id IS NULL AND task_id IS NOT NULL AND next_step_id IS NULL) OR (operational_type = 'next_step' AND question_id IS NULL AND commitment_id IS NULL AND task_id IS NULL AND next_step_id IS NOT NULL)", name="ck_analysis_operational_type_target"),
+        Index("uq_analysis_operational_question", "question_id", unique=True, sqlite_where=text("question_id IS NOT NULL")),
+        Index("uq_analysis_operational_commitment", "commitment_id", unique=True, sqlite_where=text("commitment_id IS NOT NULL")),
+        Index("uq_analysis_operational_task", "task_id", unique=True, sqlite_where=text("task_id IS NOT NULL")),
+        Index("uq_analysis_operational_next_step", "next_step_id", unique=True, sqlite_where=text("next_step_id IS NOT NULL")),
+        Index("ix_analysis_operational_run_type", "analysis_run_id", "operational_type"),
     ),
 )
