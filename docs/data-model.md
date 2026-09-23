@@ -56,7 +56,9 @@ Observations distinguish repeated processing from changed external state. They s
 
 `EmailMessage` is a source-specific representation linked to one `SourceRecord`. It records sender, recipients, subject, timestamp, Message-ID, In-Reply-To, References, mailbox folder, body/source reference, and attachment metadata when available.
 
-`Conversation` represents an email thread. It may contain zero or more messages; a message belongs to no conversation when evidence is insufficient, or one conversation when technical evidence supports reconstruction. Thread membership records retain the technical evidence used. Subject, participant, date, and CRM context cannot alone justify a merge.
+`Conversation` represents an account-scoped email thread with an opaque, immutable local stable key. After Phase 3D reconstruction, every logical `EmailMessage` has exactly one current `ConversationMembership`. A standalone, malformed, or ambiguous message occupies a singleton conversation; uncertainty never justifies merging it with another message. The current membership is the authoritative projection, with at most one row per source. Its bounded evidence fields are only summaries; parsed technical `ThreadEvidence` and subsequent `ThreadEvidenceDecision` records preserve the actual interpretation separately. Subject, participant, date, and CRM context cannot alone justify a merge.
+
+Every real initial assignment or reassignment adds an append-only `ThreadMembershipChange` in the same transaction as the current projection. A merge, split, or many-to-many repartition creates new conversation identity/identities, supersedes predecessors, and records a grouped `ThreadLineageOperation` with predecessor-to-successor `ThreadLineageEdge` rows. Evidence, decisions, assignment changes, and lineage remain queryable and are not rewritten on a later reconstruction. Legacy conversations whose account/email provenance cannot be established are explicitly `legacy_unresolved`, quarantined from normal reconstruction, and retain their existing current rows and baseline history without fabricated technical evidence. The singleton invariant is the post-reconstruction target, not a retrospective claim about quarantined or not-yet-reconstructed legacy email rows.
 
 ### ManualNote and WhatsAppImport
 
@@ -169,7 +171,7 @@ The MVP has one configured mailbox initially and one configured primary Calendar
 ## 12. Logical integrity and idempotency
 
 - Source identifiers are unique within source-system scope; manual sources have local logical identities.
-- A message cannot be assigned to multiple conversations. Uncertain thread membership remains absent.
+- After Phase 3D reconstruction, a logical email has exactly one current conversation; uncertain/unlinked emails have singleton conversations. The current projection physically prevents multiple assignments for one source. Quarantined legacy rows are excluded until separately resolved, and migration alone does not invent missing assignments.
 - CRM context links and identity links preserve their provenance and cannot be treated as confirmed merely through textual similarity.
 - Lifecycle records accept only their approved states and must retain transition evidence.
 - A confirmed identity correction supersedes rather than deletes the previous link.

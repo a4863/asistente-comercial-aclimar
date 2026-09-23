@@ -25,8 +25,118 @@ SourceRecord = _model("SourceRecord", "source_record", Column("source_type", Str
 SourceObservation = _model("SourceObservation", "source_observation", Column("source_record_id", Integer, ForeignKey("source_record.id"), nullable=False), Column("observed_at", DateTime(timezone=True), default=utcnow, nullable=False), Column("source_version_marker", String(255)), Column("observed_state", String(30), nullable=False), Column("outcome", String(50), nullable=False), Column("provenance", String(255), default="system", nullable=False), table_args=(UniqueConstraint("source_record_id", "source_version_marker"),))
 SynchronizationCheckpoint = _model("SynchronizationCheckpoint", "synchronization_checkpoint", Column("source_system_scope", String(100), unique=True, nullable=False), Column("checkpoint_marker", String(255)), Column("last_success_at", DateTime(timezone=True)), Column("last_outcome", String(50), default="pending", nullable=False), Column("updated_at", DateTime(timezone=True), default=utcnow, nullable=False))
 IdempotencyIdentity = _model("IdempotencyIdentity", "idempotency_identity", Column("operation_kind", String(100), nullable=False), Column("scope", String(100), nullable=False), Column("identity_key", String(255), nullable=False), Column("source_record_id", Integer, ForeignKey("source_record.id")), Column("target_reference", String(255)), Column("resolved_at", DateTime(timezone=True)), table_args=(UniqueConstraint("operation_kind", "scope", "identity_key"),))
-Conversation = _model("Conversation", "conversation", Column("provenance", String(255), default="system", nullable=False), Column("superseded_at", DateTime(timezone=True)))
-ConversationMembership = _model("ConversationMembership", "conversation_membership", Column("conversation_id", Integer, ForeignKey("conversation.id"), nullable=False), Column("source_record_id", Integer, ForeignKey("source_record.id"), unique=True, nullable=False), Column("evidence_type", String(50), nullable=False), Column("evidence_reference", String(255), nullable=False))
+_HEX64 = "length({0}) = 64 AND {0} NOT GLOB '*[^0-9a-f]*'"
+Conversation = _model(
+    "Conversation", "conversation",
+    Column("provenance", String(255), default="system", nullable=False),
+    Column("superseded_at", DateTime(timezone=True)),
+    Column("account_scope", String(100)),
+    Column("stable_key", String(36), nullable=False),
+    Column("legacy_status", String(20), nullable=False),
+    table_args=(
+        CheckConstraint("(legacy_status = 'resolved' AND account_scope IS NOT NULL AND length(account_scope) BETWEEN 1 AND 100) OR (legacy_status = 'legacy_unresolved' AND account_scope IS NULL)", name="ck_conversation_scope_status"),
+        CheckConstraint("length(stable_key) = 36 AND stable_key = lower(stable_key) AND substr(stable_key, 9, 1) = '-' AND substr(stable_key, 14, 1) = '-' AND substr(stable_key, 15, 1) = '4' AND substr(stable_key, 19, 1) = '-' AND substr(stable_key, 24, 1) = '-' AND stable_key NOT GLOB '*[^0-9a-f-]*'", name="ck_conversation_stable_key"),
+        UniqueConstraint("account_scope", "stable_key", name="uq_conversation_scope_stable_key"),
+        Index("ix_conversation_scope_status_superseded", "account_scope", "legacy_status", "superseded_at"),
+    ),
+)
+ConversationMembership = _model("ConversationMembership", "conversation_membership", Column("conversation_id", Integer, ForeignKey("conversation.id"), nullable=False), Column("source_record_id", Integer, ForeignKey("source_record.id"), unique=True, nullable=False), Column("evidence_type", String(50), nullable=False), Column("evidence_reference", String(255), nullable=False), table_args=(Index("ix_conversation_membership_conversation_id", "conversation_id"),))
+
+ThreadEvidence = _model(
+    "ThreadEvidence", "thread_evidence",
+    Column("account_scope", String(100), nullable=False),
+    Column("source_record_id", Integer, ForeignKey("source_record.id", ondelete="RESTRICT"), nullable=False),
+    Column("header_kind", String(20), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("parse_status", String(12), nullable=False),
+    Column("canonical_token", String(998)),
+    Column("token_digest", String(64), nullable=False),
+    Column("normalization_version", Integer, nullable=False),
+    Column("source_revision", String(64), nullable=False),
+    Column("replay_key", String(64), nullable=False),
+    table_args=(
+        CheckConstraint("header_kind IN ('message_id', 'in_reply_to', 'references')", name="ck_thread_evidence_kind"),
+        CheckConstraint("parse_status IN ('valid', 'malformed')", name="ck_thread_evidence_parse_status"),
+        CheckConstraint("(parse_status = 'valid' AND canonical_token IS NOT NULL AND length(canonical_token) BETWEEN 1 AND 998) OR (parse_status = 'malformed' AND canonical_token IS NULL)", name="ck_thread_evidence_token_shape"),
+        CheckConstraint("ordinal >= 0 AND normalization_version > 0", name="ck_thread_evidence_ordinal_version"),
+        CheckConstraint(" AND ".join(_HEX64.format(name) for name in ("token_digest", "source_revision", "replay_key")), name="ck_thread_evidence_digests"),
+        CheckConstraint("length(account_scope) BETWEEN 1 AND 100", name="ck_thread_evidence_scope"),
+        UniqueConstraint("replay_key", name="uq_thread_evidence_replay"),
+        UniqueConstraint("source_record_id", "source_revision", "normalization_version", "header_kind", "ordinal", name="uq_thread_evidence_source_revision_ordinal"),
+        Index("ix_thread_evidence_scope_token_kind", "account_scope", "token_digest", "header_kind"),
+        Index("ix_thread_evidence_source_revision", "source_record_id", "source_revision"),
+    ),
+)
+
+ThreadEvidenceDecision = _model(
+    "ThreadEvidenceDecision", "thread_evidence_decision",
+    Column("evidence_id", Integer, ForeignKey("thread_evidence.id", ondelete="RESTRICT"), nullable=False),
+    Column("target_source_record_id", Integer, ForeignKey("source_record.id", ondelete="RESTRICT")),
+    Column("reconstruction_key", String(64), nullable=False),
+    Column("outcome", String(32), nullable=False),
+    Column("replay_key", String(64), nullable=False),
+    table_args=(
+        CheckConstraint("outcome IN ('identity_observed', 'accepted_direct_parent', 'accepted_ancestor', 'unresolved_external', 'duplicate_target', 'malformed', 'multiple_in_reply_to', 'self_link', 'cycle_rejected', 'conflict', 'not_linking')", name="ck_thread_decision_outcome"),
+        CheckConstraint("(outcome IN ('accepted_direct_parent', 'accepted_ancestor') AND target_source_record_id IS NOT NULL) OR (outcome NOT IN ('accepted_direct_parent', 'accepted_ancestor') AND target_source_record_id IS NULL)", name="ck_thread_decision_target"),
+        CheckConstraint(" AND ".join(_HEX64.format(name) for name in ("reconstruction_key", "replay_key")), name="ck_thread_decision_keys"),
+        UniqueConstraint("evidence_id", "reconstruction_key", name="uq_thread_decision_evidence_reconstruction"),
+        UniqueConstraint("replay_key", name="uq_thread_decision_replay"),
+        Index("ix_thread_decision_target", "target_source_record_id"),
+        Index("ix_thread_decision_reconstruction_outcome", "reconstruction_key", "outcome"),
+    ),
+)
+
+ThreadMembershipChange = _model(
+    "ThreadMembershipChange", "thread_membership_change",
+    Column("source_record_id", Integer, ForeignKey("source_record.id", ondelete="RESTRICT"), nullable=False),
+    Column("account_scope", String(100)),
+    Column("old_conversation_id", Integer, ForeignKey("conversation.id", ondelete="RESTRICT")),
+    Column("new_conversation_id", Integer, ForeignKey("conversation.id", ondelete="RESTRICT"), nullable=False),
+    Column("reason", String(32), nullable=False),
+    Column("evidence_decision_id", Integer, ForeignKey("thread_evidence_decision.id", ondelete="RESTRICT")),
+    Column("reconstruction_key", String(64)),
+    Column("replay_key", String(64), nullable=False),
+    table_args=(
+        CheckConstraint("reason IN ('legacy_assignment_baseline', 'initial_assignment', 'merge', 'split', 'repartition', 'correction')", name="ck_thread_membership_change_reason"),
+        CheckConstraint("(reason IN ('legacy_assignment_baseline', 'initial_assignment') AND old_conversation_id IS NULL) OR (reason IN ('merge', 'split', 'repartition', 'correction') AND old_conversation_id IS NOT NULL AND old_conversation_id != new_conversation_id)", name="ck_thread_membership_change_old_new"),
+        CheckConstraint("(reason = 'legacy_assignment_baseline' AND reconstruction_key IS NULL AND evidence_decision_id IS NULL) OR (reason != 'legacy_assignment_baseline' AND account_scope IS NOT NULL AND length(account_scope) BETWEEN 1 AND 100 AND reconstruction_key IS NOT NULL)", name="ck_thread_membership_change_baseline"),
+        CheckConstraint(_HEX64.format("replay_key") + " AND (reconstruction_key IS NULL OR (" + _HEX64.format("reconstruction_key") + "))", name="ck_thread_membership_change_keys"),
+        UniqueConstraint("replay_key", name="uq_thread_membership_change_replay"),
+        Index("ix_thread_membership_change_source_time", "source_record_id", "created_at", "id"),
+        Index("ix_thread_membership_change_old", "old_conversation_id"),
+        Index("ix_thread_membership_change_new", "new_conversation_id"),
+        Index("ix_thread_membership_change_scope_reconstruction", "account_scope", "reconstruction_key"),
+    ),
+)
+
+ThreadLineageOperation = _model(
+    "ThreadLineageOperation", "thread_lineage_operation",
+    Column("account_scope", String(100), nullable=False),
+    Column("kind", String(16), nullable=False),
+    Column("reconstruction_key", String(64), nullable=False),
+    Column("replay_key", String(64), nullable=False),
+    Column("provenance", String(50), nullable=False),
+    table_args=(
+        CheckConstraint("kind IN ('merge', 'split', 'repartition')", name="ck_thread_lineage_operation_kind"),
+        CheckConstraint(_HEX64.format("reconstruction_key") + " AND " + _HEX64.format("replay_key"), name="ck_thread_lineage_operation_keys"),
+        CheckConstraint("length(account_scope) BETWEEN 1 AND 100 AND length(provenance) BETWEEN 1 AND 50", name="ck_thread_lineage_operation_scope_provenance"),
+        UniqueConstraint("replay_key", name="uq_thread_lineage_operation_replay"),
+        Index("ix_thread_lineage_operation_scope_time", "account_scope", "created_at", "id"),
+    ),
+)
+
+ThreadLineageEdge = _model(
+    "ThreadLineageEdge", "thread_lineage_edge",
+    Column("operation_id", Integer, ForeignKey("thread_lineage_operation.id", ondelete="RESTRICT"), nullable=False),
+    Column("predecessor_conversation_id", Integer, ForeignKey("conversation.id", ondelete="RESTRICT"), nullable=False),
+    Column("successor_conversation_id", Integer, ForeignKey("conversation.id", ondelete="RESTRICT"), nullable=False),
+    table_args=(
+        CheckConstraint("predecessor_conversation_id != successor_conversation_id", name="ck_thread_lineage_edge_nonself"),
+        UniqueConstraint("operation_id", "predecessor_conversation_id", "successor_conversation_id", name="uq_thread_lineage_edge_pair"),
+        Index("ix_thread_lineage_edge_predecessor", "predecessor_conversation_id"),
+        Index("ix_thread_lineage_edge_successor", "successor_conversation_id"),
+    ),
+)
 ManualNote = _model("ManualNote", "manual_note", Column("source_record_id", Integer, ForeignKey("source_record.id"), unique=True, nullable=False), Column("original_text", Text, nullable=False), Column("entered_at", DateTime(timezone=True), default=utcnow, nullable=False), Column("provenance", String(255), default="manual", nullable=False))
 WhatsAppImport = _model("WhatsAppImport", "whatsapp_import", Column("source_record_id", Integer, ForeignKey("source_record.id"), unique=True, nullable=False), Column("original_text", Text, nullable=False), Column("pasted_at", DateTime(timezone=True), default=utcnow, nullable=False), Column("provenance", String(255), default="manual", nullable=False))
 CalendarEventRepresentation = _model("CalendarEventRepresentation", "calendar_event_representation", Column("source_record_id", Integer, ForeignKey("source_record.id"), unique=True, nullable=False), Column("calendar_event_id", String(255), nullable=False), Column("starts_at", DateTime(timezone=True)), Column("ends_at", DateTime(timezone=True)), Column("current_state", String(30), default="active", nullable=False), Column("updated_at", DateTime(timezone=True), default=utcnow, nullable=False))

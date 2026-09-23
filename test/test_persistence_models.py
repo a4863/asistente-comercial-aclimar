@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import pytest
+from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 
 from app.persistence.models import (
@@ -32,6 +34,11 @@ from app.persistence.models import (
     Question,
     SourceObservation,
     Task,
+    ThreadEvidence,
+    ThreadEvidenceDecision,
+    ThreadLineageEdge,
+    ThreadLineageOperation,
+    ThreadMembershipChange,
     SourceRecord,
     WhatsAppImport,
 )
@@ -66,33 +73,35 @@ def test_source_identity_and_observation_history(db_session):
 
 def test_manual_source_and_conversation_constraints(db_session):
     one, two = source(), source()
-    db_session.add_all([one, two])
+    email_source = SourceRecord(source_type="email_message", source_system_scope="imap:account", provenance="test")
+    db_session.add_all([one, two, email_source])
     db_session.flush()
+    db_session.add(EmailMessage(source_record_id=email_source.id, provenance="test"))
     db_session.add_all(
         [
             ManualNote(source_record_id=one.id, original_text="note"),
             WhatsAppImport(source_record_id=two.id, original_text="chat"),
         ]
     )
-    conversation = Conversation(provenance="test")
+    conversation = Conversation(provenance="test", account_scope="imap:account", stable_key=str(uuid4()), legacy_status="resolved")
     db_session.add(conversation)
     db_session.flush()
     db_session.add(
         ConversationMembership(
             conversation_id=conversation.id,
-            source_record_id=one.id,
+            source_record_id=email_source.id,
             evidence_type="message_id",
             evidence_reference="x",
         )
     )
     db_session.flush()
-    other = Conversation(provenance="test")
+    other = Conversation(provenance="test", account_scope="imap:account", stable_key=str(uuid4()), legacy_status="resolved")
     db_session.add(other)
     db_session.flush()
     db_session.add(
         ConversationMembership(
             conversation_id=other.id,
-            source_record_id=one.id,
+            source_record_id=email_source.id,
             evidence_type="message_id",
             evidence_reference="x",
         )
@@ -581,6 +590,72 @@ def test_email_message_is_one_to_one_with_source_and_message_id_is_not_global(db
     db_session.add(EmailMessage(source_record_id=source.id, provenance="test"))
     with pytest.raises(IntegrityError):
         db_session.flush()
+
+
+def _constraint_rejects(session, record):
+    with pytest.raises(IntegrityError):
+        with session.begin_nested():
+            session.add(record)
+            session.flush()
+
+
+def test_phase3d1_model_schema_names_and_constraints(db_session):
+    inspector = inspect(db_session.bind)
+    tables = {"thread_evidence", "thread_evidence_decision", "thread_membership_change",
+              "thread_lineage_operation", "thread_lineage_edge"}
+    assert tables <= set(inspector.get_table_names())
+    for table in tables:
+        columns = {column["name"]: column for column in inspector.get_columns(table)}
+        assert columns["id"]["primary_key"] == 1
+        assert columns["created_at"]["nullable"] is False
+        assert all(fk["options"].get("ondelete") == "RESTRICT" for fk in inspector.get_foreign_keys(table))
+    conversation_columns = {column["name"]: column for column in inspector.get_columns("conversation")}
+    assert conversation_columns["stable_key"]["nullable"] is False
+    assert conversation_columns["legacy_status"]["nullable"] is False
+    assert "uq_conversation_scope_stable_key" in {item["name"] for item in inspector.get_unique_constraints("conversation")}
+    assert "ix_conversation_scope_status_superseded" in {item["name"] for item in inspector.get_indexes("conversation")}
+    assert "ck_thread_lineage_edge_nonself" in {item["name"] for item in inspector.get_check_constraints("thread_lineage_edge")}
+
+    source_row = SourceRecord(source_type="email_message", source_system_scope="imap:one", provenance="test")
+    db_session.add(source_row)
+    db_session.flush()
+    db_session.add(EmailMessage(source_record_id=source_row.id, provenance="test"))
+    first = Conversation(account_scope="imap:one", stable_key=str(uuid4()), legacy_status="resolved", provenance="test")
+    second = Conversation(account_scope="imap:one", stable_key=str(uuid4()), legacy_status="resolved", provenance="test")
+    db_session.add_all([first, second])
+    db_session.flush()
+    _constraint_rejects(db_session, Conversation(account_scope="imap:one", stable_key=first.stable_key,
+                                                legacy_status="resolved", provenance="test"))
+    _constraint_rejects(db_session, Conversation(account_scope=None, stable_key=str(uuid4()),
+                                                legacy_status="resolved", provenance="test"))
+    _constraint_rejects(db_session, Conversation(account_scope="imap:one", stable_key="invalid",
+                                                legacy_status="resolved", provenance="test"))
+
+    evidence = ThreadEvidence(account_scope="imap:one", source_record_id=source_row.id,
+        header_kind="message_id", ordinal=0, parse_status="valid", canonical_token="one@example.test",
+        token_digest="a" * 64, normalization_version=1, source_revision="b" * 64, replay_key="c" * 64)
+    db_session.add(evidence)
+    db_session.flush()
+    _constraint_rejects(db_session, ThreadEvidence(account_scope="imap:one", source_record_id=source_row.id,
+        header_kind="references", ordinal=0, parse_status="malformed", canonical_token="raw",
+        token_digest="a" * 64, normalization_version=1, source_revision="b" * 64, replay_key="d" * 64))
+    _constraint_rejects(db_session, ThreadEvidenceDecision(evidence_id=evidence.id,
+        reconstruction_key="a" * 64, outcome="accepted_direct_parent", replay_key="e" * 64))
+    _constraint_rejects(db_session, ThreadMembershipChange(source_record_id=source_row.id,
+        account_scope="imap:one", old_conversation_id=first.id, new_conversation_id=first.id,
+        reason="correction", reconstruction_key="a" * 64, replay_key="f" * 64))
+    operation = ThreadLineageOperation(account_scope="imap:one", kind="merge",
+        reconstruction_key="a" * 64, replay_key="0" * 64, provenance="test")
+    db_session.add(operation)
+    db_session.flush()
+    _constraint_rejects(db_session, ThreadLineageEdge(operation_id=operation.id,
+        predecessor_conversation_id=first.id, successor_conversation_id=first.id))
+    edge = ThreadLineageEdge(operation_id=operation.id,
+        predecessor_conversation_id=first.id, successor_conversation_id=second.id)
+    db_session.add(edge)
+    db_session.flush()
+    _constraint_rejects(db_session, ThreadLineageEdge(operation_id=operation.id,
+        predecessor_conversation_id=first.id, successor_conversation_id=second.id))
 
 
 def test_email_message_rejects_negative_body_size(db_session):

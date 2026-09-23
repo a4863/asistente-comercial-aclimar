@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from hashlib import sha256
 
 import pytest
 from sqlalchemy import select
@@ -26,6 +27,11 @@ from app.persistence.models import (
     SourceRecord,
     SynchronizationCheckpoint,
     Task,
+    ThreadEvidence,
+    ThreadEvidenceDecision,
+    ThreadLineageEdge,
+    ThreadLineageOperation,
+    ThreadMembershipChange,
 )
 from app.persistence.repositories import (
     ActionRepository,
@@ -35,6 +41,7 @@ from app.persistence.repositories import (
     OperationalRepository,
     ProvenanceRepository,
     SourceRepository,
+    ThreadPersistenceRepository,
 )
 
 
@@ -319,16 +326,19 @@ def test_retention_transition_preserves_observation_history(db_session):
 
 
 def test_provenance_conversation_notes_activity_and_crm_reference(db_session):
+    db_session.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
     provenance = ProvenanceRepository(db_session)
-    source = _source(db_session, "prov-1")
+    _, source, _, _, _ = _imap_occurrence(db_session)
 
-    conversation = provenance.create_conversation("test")
+    conversation = provenance.create_conversation("test", "imap:account")
     db_session.flush()
     membership = provenance.add_conversation_membership(
         conversation.id,
         source.id,
-        "message_id",
-        "m-1",
+        "singleton",
+        f"source:{source.id}",
+        account_scope="imap:account",
+        reconstruction_key="a" * 64,
     )
 
     note_source = _source(db_session, "note-1")
@@ -359,6 +369,173 @@ def test_provenance_conversation_notes_activity_and_crm_reference(db_session):
     assert chat.original_text == "chat"
     assert link.activity_id == activity.id
     assert same is crm
+
+
+def _thread_repo(db_session):
+    db_session.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
+    return ThreadPersistenceRepository(db_session)
+
+
+def _thread_source(db_session, scope="imap:one", message_id="<one@example.test>"):
+    source = SourceRecord(source_type="email_message", source_system_scope=scope, provenance="test")
+    db_session.add(source)
+    db_session.flush()
+    db_session.add(EmailMessage(source_record_id=source.id, normalized_message_id=message_id,
+                                references_header="<root@example.test>", provenance="test"))
+    db_session.flush()
+    return source
+
+
+def _thread_evidence(repo, source, token="one@example.test"):
+    email = repo.session.scalar(select(EmailMessage).where(EmailMessage.source_record_id == source.id))
+    return repo.append_evidence(
+        account_scope=source.source_system_scope, source_record_id=source.id,
+        header_kind="message_id", ordinal=0, parse_status="valid", canonical_token=token,
+        token_digest=sha256(token.encode()).hexdigest(), normalization_version=1,
+        source_revision=repo._digest("3d1/source-revision/v1", source.id,
+            email.normalized_message_id, email.in_reply_to, email.references_header),
+    )
+
+
+def test_thread_repository_scope_email_and_old_boundary(db_session):
+    repo = _thread_repo(db_session)
+    email = _thread_source(db_session)
+    foreign = _thread_source(db_session, scope="imap:other")
+    manual = _source(db_session)
+    conversation = repo.create_resolved_conversation("imap:one", "test")
+    assert conversation.stable_key and conversation.legacy_status == "resolved"
+    assert len(repo.conversations_for_account("imap:one")) == 1
+    with pytest.raises(ValueError, match="same account"):
+        repo.current_membership("imap:one", foreign.id)
+    with pytest.raises(ValueError, match="logical email"):
+        repo.current_membership("imap:one", manual.id)
+    with pytest.raises(ValueError, match="same account"):
+        repo.assign_current_membership(account_scope="imap:other", source_record_id=email.id,
+            new_conversation_id=conversation.id, reason="initial_assignment", reconstruction_key="a" * 64,
+            evidence_type="singleton", evidence_reference=f"source:{email.id}")
+    with pytest.raises(TypeError):
+        ProvenanceRepository(db_session).create_conversation("old-unscoped")
+
+
+def test_thread_evidence_decision_replay_and_cycle(db_session):
+    repo = _thread_repo(db_session)
+    first, second = _thread_source(db_session), _thread_source(db_session, message_id="<two@example.test>")
+    first_ev = _thread_evidence(repo, first)
+    assert repo.append_evidence(account_scope="imap:one", source_record_id=first.id,
+        header_kind="message_id", ordinal=0, parse_status="valid", canonical_token="one@example.test",
+        token_digest=sha256(b"one@example.test").hexdigest(), normalization_version=1,
+        source_revision=first_ev.source_revision) is first_ev
+    second_ev = _thread_evidence(repo, second, "two@example.test")
+    assert len(repo.evidence_for_source("imap:one", first.id)) == 1
+    with pytest.raises(ValueError, match="digest mismatch"):
+        repo.append_evidence(account_scope="imap:one", source_record_id=first.id,
+            header_kind="references", ordinal=0, parse_status="valid", canonical_token="bad@example.test",
+            token_digest="a" * 64, normalization_version=1, source_revision=first_ev.source_revision)
+    with pytest.raises(ValueError, match="replay key mismatch"):
+        repo.append_evidence(account_scope="imap:one", source_record_id=first.id,
+            header_kind="message_id", ordinal=0, parse_status="valid", canonical_token="one@example.test",
+            token_digest=first_ev.token_digest, normalization_version=1,
+            source_revision=first_ev.source_revision, replay_key="b" * 64)
+    decision = repo.append_decision(evidence_id=first_ev.id, reconstruction_key="a" * 64,
+                                    outcome="accepted_direct_parent", target_source_record_id=second.id)
+    assert repo.append_decision(evidence_id=first_ev.id, reconstruction_key="a" * 64,
+                                outcome="accepted_direct_parent", target_source_record_id=second.id) is decision
+    with pytest.raises(ValueError, match="already has a decision"):
+        repo.append_decision(evidence_id=first_ev.id, reconstruction_key="a" * 64, outcome="conflict")
+    later = repo.append_decision(evidence_id=first_ev.id, reconstruction_key="b" * 64, outcome="conflict")
+    assert later.id != decision.id and len(repo.decisions_for_reconstruction("b" * 64)) == 1
+    with pytest.raises(ValueError, match="parent cycle"):
+        repo.append_decision(evidence_id=second_ev.id, reconstruction_key="a" * 64,
+                             outcome="accepted_ancestor", target_source_record_id=first.id)
+    with pytest.raises(ValueError, match="same account"):
+        outside = _thread_source(db_session, scope="imap:other")
+        repo.append_decision(evidence_id=second_ev.id, reconstruction_key="c" * 64,
+                             outcome="accepted_ancestor", target_source_record_id=outside.id)
+    assert db_session.query(ThreadEvidenceDecision).count() == 2
+
+
+def test_thread_membership_projection_history_replay_and_rollback(db_session):
+    repo = _thread_repo(db_session)
+    source = _thread_source(db_session)
+    first = repo.create_resolved_conversation("imap:one", "test")
+    second = repo.create_resolved_conversation("imap:one", "test")
+    unrelated = repo.create_resolved_conversation("imap:one", "test")
+    values = dict(account_scope="imap:one", source_record_id=source.id,
+                  new_conversation_id=first.id, reason="initial_assignment",
+                  reconstruction_key="a" * 64, evidence_type="singleton",
+                  evidence_reference=f"source:{source.id}")
+    membership = repo.assign_current_membership(**values)
+    assert repo.assign_current_membership(**values) is membership
+    assert len(repo.membership_history("imap:one", source.id)) == 1
+    with pytest.raises(ValueError, match="stale"):
+        repo.assign_current_membership(**(values | {"new_conversation_id": second.id,
+            "reason": "correction", "reconstruction_key": "b" * 64,
+            "expected_old_conversation_id": unrelated.id}))
+    with db_session.begin_nested() as savepoint:
+        repo.assign_current_membership(**(values | {"new_conversation_id": second.id,
+            "reason": "correction", "reconstruction_key": "b" * 64,
+            "expected_old_conversation_id": first.id}))
+        assert membership.conversation_id == second.id
+        savepoint.rollback()
+    db_session.expire_all()
+    assert repo.current_membership("imap:one", source.id).conversation_id == first.id
+    assert len(repo.membership_history("imap:one", source.id)) == 1
+    assert db_session.query(ThreadMembershipChange).count() == 1
+    repo.assign_current_membership(**(values | {"new_conversation_id": second.id,
+        "reason": "correction", "reconstruction_key": "b" * 64,
+        "expected_old_conversation_id": first.id}))
+    assert repo.assign_current_membership(**values).conversation_id == second.id
+    assert len(repo.membership_history("imap:one", source.id)) == 2
+
+
+def test_thread_lineage_merge_split_repartition_and_guards(db_session):
+    repo = _thread_repo(db_session)
+    rows = [repo.create_resolved_conversation("imap:one", "test") for _ in range(10)]
+    merge = repo.record_lineage_operation(account_scope="imap:one", kind="merge",
+        predecessor_ids=[rows[0].id, rows[1].id], successor_ids=[rows[2].id],
+        reconstruction_key="a" * 64)
+    assert len(repo.lineage_from(rows[0].id)) == 1
+    assert len(repo.lineage_to(rows[2].id)) == 2
+    assert repo.record_lineage_operation(account_scope="imap:one", kind="merge",
+        predecessor_ids=[rows[1].id, rows[0].id], successor_ids=[rows[2].id],
+        reconstruction_key="a" * 64) is merge
+    with pytest.raises(ValueError, match="already superseded"):
+        repo.record_lineage_operation(account_scope="imap:one", kind="merge",
+            predecessor_ids=[rows[0].id, rows[3].id], successor_ids=[rows[4].id],
+            reconstruction_key="b" * 64)
+    split = repo.record_lineage_operation(account_scope="imap:one", kind="split",
+        predecessor_ids=[rows[3].id], successor_ids=[rows[4].id, rows[5].id],
+        reconstruction_key="c" * 64)
+    assert len(repo.lineage_from(rows[3].id)) == 2
+    repartition = repo.record_lineage_operation(account_scope="imap:one", kind="repartition",
+        predecessor_ids=[rows[6].id, rows[7].id], successor_ids=[rows[8].id, rows[9].id],
+        reconstruction_key="d" * 64)
+    assert len(repo.session.scalars(select(ThreadLineageEdge).where(ThreadLineageEdge.operation_id == repartition.id)).all()) == 4
+    assert db_session.query(ThreadLineageOperation).count() == 3
+    with pytest.raises(ValueError, match="invalid lineage"):
+        repo.record_lineage_operation(account_scope="imap:one", kind="merge",
+            predecessor_ids=[rows[4].id, rows[5].id], successor_ids=[rows[4].id],
+            reconstruction_key="e" * 64)
+    assert split.id != merge.id
+
+
+def test_thread_lineage_cycle_is_rejected_without_mutation(db_session):
+    repo = _thread_repo(db_session)
+    first, second, third = [repo.create_resolved_conversation("imap:one", "test") for _ in range(3)]
+    # An existing historical edge can be imported or otherwise observed before supersession projection.
+    prior = ThreadLineageOperation(account_scope="imap:one", kind="merge",
+        reconstruction_key="a" * 64, replay_key="b" * 64, provenance="test")
+    db_session.add(prior)
+    db_session.flush()
+    db_session.add(ThreadLineageEdge(operation_id=prior.id,
+        predecessor_conversation_id=first.id, successor_conversation_id=second.id))
+    db_session.flush()
+    with pytest.raises(ValueError, match="lineage cycle"):
+        repo.record_lineage_operation(account_scope="imap:one", kind="merge",
+            predecessor_ids=[second.id, third.id], successor_ids=[first.id],
+            reconstruction_key="c" * 64)
+    assert first.superseded_at is None and second.superseded_at is None
+    assert db_session.query(ThreadLineageOperation).count() == 1
 
 
 def test_crm_context_repository_guards(db_session):
