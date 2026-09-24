@@ -9,15 +9,18 @@ import pytest
 from sqlalchemy import select
 
 from app.domain.email_analysis import (
-    AnalysisCandidates, AnalysisInput, EvidenceCandidate, FactCandidate,
-    QuestionCandidate, select_analysis_input,
+    AnalysisCandidates, AnalysisInput, AnalyticalSignalCandidate,
+    CommitmentCandidate, ContextMention, EvidenceCandidate, FactCandidate,
+    InferenceCandidate, NextStepCandidate, ProposalCandidate, QuestionCandidate,
+    SupportRef, TaskCandidate, select_analysis_input,
 )
 from app.persistence.database import make_session_factory
 from app.persistence.models import (
-    ActionProposal, Alert, AnalysisDerivationLink, AnalysisRun,
+    ActionProposal, Alert, AnalysisDerivationLink, AnalysisOperationalLink, AnalysisRun,
     AnalysisSourceEvidence, AnalysisSummary, ApprovalDecision, Base,
-    Conversation, ConversationMembership, EmailMessage, ExecutionResult,
-    ExtractedFact, Question, SourceRecord,
+    Commitment, Conversation, ConversationMembership, EmailMessage, ExecutionResult,
+    ExtractedFact, FactSourceEvidence, Inference, NextStep, OperationalEvidenceLink,
+    Proposal, Question, SourceRecord, Task,
 )
 from app.persistence.repositories import (
     AnalysisRepository, AnalysisRepositoryError,
@@ -302,3 +305,136 @@ def test_repository_persistence_failure_rolls_back_then_marks_retryable(analysis
     assert _runs(analysis_db)[0].status == "failed_retryable"
     with analysis_db() as session:
         assert session.scalars(select(AnalysisSummary)).all() == []
+
+
+def test_six_prior_and_thirty_thousand_character_disclosure_limit(analysis_db):
+    with analysis_db() as session, session.begin():
+        conversation = Conversation(account_scope="imap:test", stable_key=str(uuid4()),
+                                    legacy_status="resolved", provenance="test")
+        session.add(conversation)
+        session.flush()
+        for index in range(8):
+            source = SourceRecord(source_type="email_message", source_system_scope="imap:test",
+                                  stable_external_id=str(uuid4()), provenance="test")
+            session.add(source)
+            session.flush()
+            session.add_all((
+                EmailMessage(source_record_id=source.id, normalized_body=str(index) * 10000,
+                             subject=f"Prior {index}", provenance="test"),
+                ConversationMembership(conversation_id=conversation.id,
+                                       source_record_id=source.id, evidence_type="test",
+                                       evidence_reference="test"),
+            ))
+        target = SourceRecord(source_type="email_message", source_system_scope="imap:test",
+                              stable_external_id=str(uuid4()), provenance="test")
+        session.add(target)
+        session.flush()
+        target_id = target.id
+        session.add_all((
+            EmailMessage(source_record_id=target_id, normalized_body="T" * 10000,
+                         subject="Target", provenance="test"),
+            ConversationMembership(conversation_id=conversation.id,
+                                   source_record_id=target_id, evidence_type="test",
+                                   evidence_reference="test"),
+        ))
+
+    class CaptureProvider:
+        seen = None
+
+        def analyze(self, analysis_input):
+            self.seen = analysis_input
+            return AnalysisCandidates()
+
+    provider = CaptureProvider()
+    assert analyze_email_in_thread(analysis_db, provider, "imap:test", target_id).status == "completed"
+    messages = provider.seen.selected_messages
+    assert len(messages) == 7
+    assert messages[0].body_excerpt == "T" * 10000
+    assert [item.subject for item in messages[1:]] == [f"Prior {index}" for index in range(7, 1, -1)]
+    assert sum(len(item.body_excerpt) for item in messages) == 30000
+    assert [len(item.body_excerpt) for item in messages[1:]] == [10000, 10000, 0, 0, 0, 0]
+
+
+def test_oversized_target_discloses_no_prior_body_but_keeps_metadata(analysis_db):
+    target_id, _, prior_id = _seed(analysis_db, body="T" * 35000,
+                                   prior_body="sensitive prior body")
+
+    class CaptureProvider:
+        seen = None
+
+        def analyze(self, analysis_input):
+            self.seen = analysis_input
+            return AnalysisCandidates()
+
+    provider = CaptureProvider()
+    assert analyze_email_in_thread(analysis_db, provider, "imap:test", target_id).status == "completed"
+    target, prior = provider.seen.selected_messages
+    assert len(target.body_excerpt) == 30000
+    assert prior.source_record_id == prior_id and prior.subject == "Prior"
+    assert prior.body_excerpt == ""
+    assert "sensitive prior body" not in repr(provider.seen)
+
+
+def test_phase4_synthetic_thread_end_to_end_with_append_only_reanalysis(analysis_db):
+    body = ("Please quote Project Blue?\n"
+            "I promise to review the quotation.\n")
+    target_id, _, prior_id = _seed(analysis_db, body=body,
+                                   prior_body="Earlier inquiry for Project Blue.")
+
+    def span(text):
+        start = body.index(text)
+        return EvidenceCandidate(target_id, start, start + len(text),
+                                 sha256(text.encode("utf-8")).hexdigest(), text)
+
+    question = span("Please quote Project Blue?")
+    promise = span("I promise to review the quotation.")
+    mention = span("Project Blue")
+    candidates = AnalysisCandidates(
+        summary="A quotation is requested for Project Blue; review was promised.",
+        facts=(FactCandidate("quotation_request", "Project Blue", question),),
+        inferences=(InferenceCandidate("commercial_intent", "active_request",
+                                       (SupportRef("fact", 0),)),),
+        proposals=(ProposalCandidate("prepare_offer", "Project Blue quotation",
+                                     (SupportRef("inference", 0),)),),
+        questions=(QuestionCandidate(question.exact_text, question, "new"),),
+        commitments=(CommitmentCandidate("Review the quotation", "self", "none",
+                                         None, None, promise, True),),
+        tasks=(TaskCandidate("Prepare quotation", None,
+                             (SupportRef("proposal", 0),)),),
+        next_steps=(NextStepCandidate("Share quotation", None,
+                                      (SupportRef("proposal", 0),)),),
+        response_needed=AnalyticalSignalCandidate("yes", (SupportRef("fact", 0),)),
+        commercial_risk=AnalyticalSignalCandidate("low", (SupportRef("fact", 0),)),
+        priority=AnalyticalSignalCandidate("normal", (SupportRef("fact", 0),)),
+        context_mentions=(ContextMention("work", "Project Blue", mention),),
+    )
+    fake = FakeAIService(default_output=candidates)
+    first = analyze_email_in_thread(analysis_db, fake, "imap:test", target_id)
+    assert first.status == "completed" and len(fake.calls) == 1
+    with analysis_db() as session:
+        run = session.get(AnalysisRun, first.run_id)
+        assert run.status == "completed" and run.target_source_record_id == target_id
+        assert len(session.scalars(select(AnalysisSourceEvidence)).all()) == 3
+        assert len(session.scalars(select(FactSourceEvidence)).all()) == 3
+        assert len(session.scalars(select(Inference)).all()) == 4
+        assert len(session.scalars(select(Proposal)).all()) == 3
+        assert len(session.scalars(select(AnalysisOperationalLink)).all()) == 4
+        assert len(session.scalars(select(OperationalEvidenceLink)).all()) == 6
+        assert session.scalar(select(AnalysisSummary)).summary_text == candidates.summary
+        assert session.scalar(select(Question)).state == "detected"
+        assert session.scalar(select(Commitment)).state == "confirmed"
+        assert session.scalar(select(Task)).state == "proposed"
+        assert session.scalar(select(NextStep)).state == "proposed"
+        assert session.scalars(select(ActionProposal)).all() == []
+        assert prior_id in [item.source_record_id for item in
+                            select_analysis_input(session, "imap:test", target_id).selected_messages]
+    assert analyze_email_in_thread(analysis_db, fake, "imap:test", target_id).status == "completed_replay"
+    assert len(fake.calls) == 1
+    second = analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                     force_reanalysis=True)
+    assert second.status == "completed" and len(fake.calls) == 2
+    with analysis_db() as session:
+        newer = session.get(AnalysisRun, second.run_id)
+        assert newer.supersedes_run_id == first.run_id
+        assert len(session.scalars(select(Question)).all()) == 2
+        assert len(session.scalars(select(AnalysisSummary)).all()) == 2
