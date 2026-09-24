@@ -131,9 +131,11 @@ Do not create/set a credential in this task.
 Approved behavior:
 - no streaming;
 - one concurrent remote request per process;
-- timeout budget: 60 seconds overall for the adapter operation;
+- local operational budget: 60 seconds as a **soft overall deadline** measured with a monotonic clock;
 - maximum 2 total attempts (initial + one retry);
 - explicitly disable SDK automatic retries so the adapter owns retry behavior;
+- before each provider attempt, compute the remaining local budget and cap that attempt's SDK/request timeout to no more than the remaining budget;
+- do not claim or implement a hard real-time kill guarantee for the underlying socket/thread/process;
 - retry only verified transient classes:
   - connection failure;
   - timeout;
@@ -150,7 +152,7 @@ Approved behavior:
 
 Any retry delay must remain bounded inside the 60-second overall budget.
 
-If the SDK cannot reliably enforce this model, STOP.
+The SDK does not need to provide a hard whole-operation deadline. The approved design is local monotonic soft-deadline accounting plus per-attempt request timeouts. STOP only if the SDK cannot accept an explicit per-attempt timeout and max_retries=0, or if the adapter cannot prevent a retry after the local budget is exhausted.
 
 ## Error surface
 
@@ -287,7 +289,7 @@ STOP if:
 - another production file is required;
 - existing AIService contract must change;
 - existing Phase 4 DTOs must change;
-- safe retry/timeout control cannot be implemented;
+- per-attempt timeout cannot be bounded by the remaining monotonic budget;
 - SDK implicit retries cannot be disabled;
 - testing requires a real API call;
 - production activation appears necessary.
