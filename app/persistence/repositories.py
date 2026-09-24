@@ -4,7 +4,8 @@ from hashlib import sha256
 import re
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.persistence.models import (
@@ -12,6 +13,7 @@ from app.persistence.models import (
     Activity,
     ActivitySourceLink,
     Alert,
+    AnalysisRun,
     ApprovalDecision,
     AuditEvent,
     Commitment,
@@ -130,6 +132,228 @@ class AccountThreadSource:
 class AccountThreadSnapshot:
     account_scope: str
     sources: tuple[AccountThreadSource, ...]
+
+
+class AnalysisRepositoryError(ValueError):
+    """Bounded Phase 4 repository failure, without SQL or source content."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisReservation:
+    outcome: str  # reserved_new | completed_replay | in_progress
+    run: AnalysisRun
+
+
+class AnalysisRepository:
+    """Phase 4C run identity/status only; the caller owns the transaction.
+
+    This class does not persist derivations or implement complete_run. The
+    finalization helper must later be called in the same transaction as 4D's
+    validated derivation inserts.
+    """
+
+    _DIGEST = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+    _MODES = frozenset({"automatic", "manual", "force"})
+    _FAILED_CODES = frozenset({"provider_failure", "invalid_output", "persistence_failure", "interrupted"})
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    @staticmethod
+    def _id(value: int) -> None:
+        if type(value) is not int or value <= 0:
+            raise AnalysisRepositoryError("invalid_identity")
+
+    @staticmethod
+    def _scope(value: str) -> None:
+        if not isinstance(value, str) or not 1 <= len(value) <= 100:
+            raise AnalysisRepositoryError("invalid_scope")
+
+    def _target(self, account_scope: str, target_source_record_id: int,
+                conversation_id: int) -> None:
+        self._scope(account_scope)
+        self._id(target_source_record_id)
+        self._id(conversation_id)
+        with self.session.no_autoflush:
+            row = self.session.execute(
+                select(SourceRecord, EmailMessage, ConversationMembership, Conversation)
+                .join(EmailMessage, EmailMessage.source_record_id == SourceRecord.id)
+                .join(ConversationMembership, ConversationMembership.source_record_id == SourceRecord.id)
+                .join(Conversation, Conversation.id == ConversationMembership.conversation_id)
+                .where(SourceRecord.id == target_source_record_id)
+            ).one_or_none()
+        if row is None:
+            raise AnalysisRepositoryError("invalid_target")
+        source, email, membership, conversation = row
+        if (source.source_type != "email_message" or source.source_system_scope != account_scope
+                or source.retention_state != "active" or source.deleted_or_redacted_at is not None
+                or email.normalized_body is None or membership.conversation_id != conversation_id
+                or conversation.id != conversation_id or conversation.account_scope != account_scope
+                or conversation.legacy_status != "resolved" or conversation.superseded_at is not None):
+            raise AnalysisRepositoryError("invalid_target")
+
+    def latest_completed_run(self, account_scope: str, target_source_record_id: int) -> AnalysisRun | None:
+        self._scope(account_scope)
+        self._id(target_source_record_id)
+        with self.session.no_autoflush:
+            return self.session.scalar(
+                select(AnalysisRun).where(
+                    AnalysisRun.account_scope == account_scope,
+                    AnalysisRun.target_source_record_id == target_source_record_id,
+                    AnalysisRun.status == "completed",
+                ).order_by(AnalysisRun.run_version.desc()).limit(1)
+            )
+
+    def replay_lookup(self, account_scope: str, target_source_record_id: int,
+                      input_digest: str, contract_version: int,
+                      policy_version: int) -> AnalysisRun | None:
+        self._validate_input(input_digest, contract_version, policy_version)
+        latest = self.latest_completed_run(account_scope, target_source_record_id)
+        if latest is not None and (
+            latest.input_digest, latest.contract_version, latest.policy_version
+        ) == (input_digest, contract_version, policy_version):
+            return latest
+        return None
+
+    @classmethod
+    def _validate_input(cls, input_digest: str, contract_version: int,
+                        policy_version: int) -> None:
+        if not isinstance(input_digest, str) or cls._DIGEST.fullmatch(input_digest) is None:
+            raise AnalysisRepositoryError("invalid_digest")
+        if (type(contract_version) is not int or contract_version <= 0
+                or type(policy_version) is not int or policy_version <= 0):
+            raise AnalysisRepositoryError("invalid_version")
+
+    def reserve_run(self, account_scope: str, target_source_record_id: int,
+                    conversation_id: int, input_digest: str, contract_version: int,
+                    policy_version: int, request_mode: str) -> AnalysisReservation:
+        if not isinstance(request_mode, str) or request_mode not in self._MODES:
+            raise AnalysisRepositoryError("invalid_request_mode")
+        self._validate_input(input_digest, contract_version, policy_version)
+        self._target(account_scope, target_source_record_id, conversation_id)
+        with self.session.no_autoflush:
+            reserved = self.session.scalar(
+                select(AnalysisRun).where(
+                    AnalysisRun.account_scope == account_scope,
+                    AnalysisRun.target_source_record_id == target_source_record_id,
+                    AnalysisRun.input_digest == input_digest,
+                    AnalysisRun.contract_version == contract_version,
+                    AnalysisRun.policy_version == policy_version,
+                    AnalysisRun.status == "reserved",
+                ).order_by(AnalysisRun.run_version.desc()).limit(1)
+            )
+            if reserved is not None:
+                return AnalysisReservation("in_progress", reserved)
+            if request_mode != "force":
+                replay = self.replay_lookup(account_scope, target_source_record_id,
+                                            input_digest, contract_version, policy_version)
+                if replay is not None:
+                    return AnalysisReservation("completed_replay", replay)
+            latest_version = self.session.scalar(
+                select(AnalysisRun.run_version).where(
+                    AnalysisRun.account_scope == account_scope,
+                    AnalysisRun.target_source_record_id == target_source_record_id,
+                ).order_by(AnalysisRun.run_version.desc()).limit(1)
+            ) or 0
+        now = datetime.now(timezone.utc)
+        run = AnalysisRun(
+            account_scope=account_scope, target_source_record_id=target_source_record_id,
+            conversation_id=conversation_id, run_version=latest_version + 1,
+            input_digest=input_digest, contract_version=contract_version,
+            policy_version=policy_version, request_mode=request_mode,
+            status="reserved", updated_at=now,
+        )
+        try:
+            self.session.add(run)
+            self.session.flush([run])
+        except IntegrityError:
+            # The caller must roll back its transaction before retrying.
+            raise AnalysisRepositoryError("reservation_conflict") from None
+        return AnalysisReservation("reserved_new", run)
+
+    def mark_retryable(self, run_id: int, *, expected_status: str = "reserved",
+                       status: str, failure_code: str) -> AnalysisRun:
+        self._id(run_id)
+        if expected_status != "reserved" or not (
+            (status == "stale_retryable" and failure_code == "input_changed")
+            or (status == "failed_retryable" and failure_code in self._FAILED_CODES)
+        ):
+            raise AnalysisRepositoryError("invalid_retryable_transition")
+        with self.session.no_autoflush:
+            result = self.session.execute(
+                update(AnalysisRun).where(
+                    AnalysisRun.id == run_id,
+                    AnalysisRun.status == expected_status,
+                ).values(status=status, failure_code=failure_code,
+                         updated_at=datetime.now(timezone.utc))
+            )
+        if result.rowcount != 1:
+            raise AnalysisRepositoryError("run_state_conflict")
+        return self.session.get(AnalysisRun, run_id, populate_existing=True)
+
+    def finalize_run_status(self, run_id: int, *, expected_status: str = "reserved") -> AnalysisRun:
+        """Link/complete the run; 4D must pair this with its inserts atomically."""
+        self._id(run_id)
+        if expected_status != "reserved":
+            raise AnalysisRepositoryError("invalid_completion_transition")
+        with self.session.no_autoflush:
+            run = self.session.get(AnalysisRun, run_id)
+            if run is None or run.status != "reserved":
+                raise AnalysisRepositoryError("run_state_conflict")
+            self._target(run.account_scope, run.target_source_record_id, run.conversation_id)
+            predecessor = self.session.scalar(
+                select(AnalysisRun).where(
+                    AnalysisRun.account_scope == run.account_scope,
+                    AnalysisRun.target_source_record_id == run.target_source_record_id,
+                    AnalysisRun.status == "completed",
+                    AnalysisRun.id != run.id,
+                ).order_by(AnalysisRun.run_version.desc()).limit(1)
+            )
+        if predecessor is not None and predecessor.run_version >= run.run_version:
+            raise AnalysisRepositoryError("run_order_conflict")
+        predecessor_id = predecessor.id if predecessor is not None else None
+        try:
+            result = self.session.execute(
+                update(AnalysisRun).where(
+                    AnalysisRun.id == run_id,
+                    AnalysisRun.status == expected_status,
+                    AnalysisRun.supersedes_run_id.is_(None),
+                ).values(status="completed", completed_at=datetime.now(timezone.utc),
+                         supersedes_run_id=predecessor_id,
+                         updated_at=datetime.now(timezone.utc))
+            )
+            if result.rowcount != 1:
+                raise AnalysisRepositoryError("run_state_conflict")
+        except IntegrityError:
+            # A uniqueness race is a bounded conflict; the caller rolls back.
+            raise AnalysisRepositoryError("completion_conflict") from None
+        return self.session.get(AnalysisRun, run_id, populate_existing=True)
+
+    def run_history(self, account_scope: str, target_source_record_id: int) -> tuple[AnalysisRun, ...]:
+        self._scope(account_scope)
+        self._id(target_source_record_id)
+        with self.session.no_autoflush:
+            return tuple(self.session.scalars(
+                select(AnalysisRun).where(
+                    AnalysisRun.account_scope == account_scope,
+                    AnalysisRun.target_source_record_id == target_source_record_id,
+                ).order_by(AnalysisRun.run_version)
+            ))
+
+    def run_provenance(self, run_id: int) -> str:
+        self._id(run_id)
+        with self.session.no_autoflush:
+            run = self.session.get(AnalysisRun, run_id)
+        if run is None:
+            raise AnalysisRepositoryError("invalid_run")
+        if run.status != "completed":
+            return "not_completed"
+        current = self.latest_completed_run(run.account_scope, run.target_source_record_id)
+        return "current_analysis" if current.id == run.id else "superseded_analysis_needs_review"
 
 
 class SourceRepository:

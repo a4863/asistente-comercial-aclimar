@@ -9,6 +9,11 @@ from sqlalchemy.exc import IntegrityError
 
 from app.persistence.models import (
     Alert,
+    AnalysisDerivationLink,
+    AnalysisOperationalLink,
+    AnalysisRun,
+    AnalysisSourceEvidence,
+    AnalysisSummary,
     ApprovalDecision,
     AuditEvent,
     Commitment,
@@ -39,6 +44,8 @@ from app.persistence.models import (
 )
 from app.persistence.repositories import (
     ActionRepository,
+    AnalysisRepository,
+    AnalysisRepositoryError,
     AuditRepository,
     DerivationRepository,
     IMAPSyncRepository,
@@ -1046,3 +1053,228 @@ def test_operational_evidence_validation(db_session):
         repository.add_operational_evidence("task", task.id, "user_confirmation", evidence_id=1, evidence_reference="bad")
     with pytest.raises(ValueError):
         repository.add_operational_evidence("task", task.id, "source")
+
+
+def _analysis_target(db_session, *, scope="imap:one"):
+    source = SourceRecord(source_type="email_message", source_system_scope=scope,
+                          stable_external_id=str(uuid4()), provenance="test")
+    conversation = Conversation(account_scope=scope, stable_key=str(uuid4()),
+                                legacy_status="resolved", provenance="test")
+    db_session.add_all((source, conversation))
+    db_session.flush()
+    db_session.add_all((
+        EmailMessage(source_record_id=source.id, normalized_body="body", provenance="test"),
+        ConversationMembership(conversation_id=conversation.id, source_record_id=source.id,
+                               evidence_type="test", evidence_reference="test"),
+    ))
+    db_session.flush()
+    return source, conversation
+
+
+def _reserve_analysis(repo, source, conversation, *, digest="a" * 64,
+                      mode="automatic", contract_version=1, policy_version=1,
+                      scope="imap:one"):
+    return repo.reserve_run(scope, source.id, conversation.id, digest,
+                            contract_version, policy_version, mode)
+
+
+def test_analysis_reservation_in_progress_and_changed_input_versions(db_session):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    first = _reserve_analysis(repo, source, conversation)
+    assert first.outcome == "reserved_new" and first.run.run_version == 1
+    assert first.run.status == "reserved"
+    assert _reserve_analysis(repo, source, conversation).outcome == "in_progress"
+    second = _reserve_analysis(repo, source, conversation, digest="b" * 64)
+    assert second.outcome == "reserved_new" and second.run.run_version == 2
+    assert [run.run_version for run in repo.run_history("imap:one", source.id)] == [1, 2]
+    assert repo.run_provenance(first.run.id) == "not_completed"
+
+
+def test_analysis_manual_automatic_replay_and_repeated_force(db_session):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    first = _reserve_analysis(repo, source, conversation).run
+    repo.finalize_run_status(first.id)
+    for mode in ("manual", "automatic"):
+        replay = _reserve_analysis(repo, source, conversation, mode=mode)
+        assert replay.outcome == "completed_replay" and replay.run.id == first.id
+    second = _reserve_analysis(repo, source, conversation, mode="force").run
+    assert second.run_version == 2
+    assert _reserve_analysis(repo, source, conversation, mode="force").outcome == "in_progress"
+    repo.finalize_run_status(second.id)
+    third = _reserve_analysis(repo, source, conversation, mode="force").run
+    assert third.run_version == 3
+    repo.finalize_run_status(third.id)
+    assert second.supersedes_run_id == first.id
+    assert third.supersedes_run_id == second.id
+    assert repo.run_provenance(first.id) == "superseded_analysis_needs_review"
+    assert repo.run_provenance(third.id) == "current_analysis"
+    assert repo.latest_completed_run("imap:one", source.id).id == third.id
+    assert repo.replay_lookup("imap:one", source.id, "a" * 64, 1, 1).id == third.id
+    assert len(repo.run_history("imap:one", source.id)) == 3
+
+
+def test_analysis_replay_only_latest_completed_with_matching_versions(db_session):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    first = _reserve_analysis(repo, source, conversation).run
+    repo.finalize_run_status(first.id)
+    second = _reserve_analysis(repo, source, conversation, digest="b" * 64).run
+    repo.finalize_run_status(second.id)
+    assert repo.replay_lookup("imap:one", source.id, "a" * 64, 1, 1) is None
+    assert repo.replay_lookup("imap:one", source.id, "b" * 64, 2, 1) is None
+    assert _reserve_analysis(repo, source, conversation, digest="a" * 64).run.run_version == 3
+
+
+@pytest.mark.parametrize("status,code", [
+    ("stale_retryable", "input_changed"),
+    ("failed_retryable", "provider_failure"),
+    ("failed_retryable", "invalid_output"),
+    ("failed_retryable", "persistence_failure"),
+    ("failed_retryable", "interrupted"),
+])
+def test_analysis_retryable_history_gets_new_version(db_session, status, code):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    old = _reserve_analysis(repo, source, conversation).run
+    updated = repo.mark_retryable(old.id, status=status, failure_code=code)
+    assert updated.status == status and updated.failure_code == code
+    retry = _reserve_analysis(repo, source, conversation)
+    assert retry.outcome == "reserved_new" and retry.run.run_version == 2
+    assert repo.run_history("imap:one", source.id)[0].status == status
+    with pytest.raises(AnalysisRepositoryError) as error:
+        repo.mark_retryable(old.id, status=status, failure_code=code)
+    assert error.value.code == "run_state_conflict"
+
+
+@pytest.mark.parametrize("status,code", [
+    ("failed_retryable", "input_changed"),
+    ("stale_retryable", "provider_failure"),
+    ("failed_retryable", "raw exception text"),
+    ("completed", "provider_failure"),
+])
+def test_analysis_invalid_retryable_transition_is_bounded(db_session, status, code):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    run = _reserve_analysis(repo, source, conversation).run
+    with pytest.raises(AnalysisRepositoryError) as error:
+        repo.mark_retryable(run.id, status=status, failure_code=code)
+    assert error.value.code == "invalid_retryable_transition"
+    assert run.status == "reserved" and run.failure_code is None
+
+
+def test_analysis_completed_run_cannot_retry_or_recomplete(db_session):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    run = _reserve_analysis(repo, source, conversation).run
+    repo.finalize_run_status(run.id)
+    with pytest.raises(AnalysisRepositoryError):
+        repo.mark_retryable(run.id, status="failed_retryable", failure_code="provider_failure")
+    with pytest.raises(AnalysisRepositoryError):
+        repo.finalize_run_status(run.id)
+    assert run.status == "completed" and run.supersedes_run_id is None
+
+
+@pytest.mark.parametrize("change", [
+    {"mode": "unknown"}, {"digest": "A" * 64}, {"digest": "bad"},
+    {"contract_version": 0}, {"policy_version": -1},
+])
+def test_analysis_invalid_reservation_input_creates_no_run(db_session, change):
+    source, conversation = _analysis_target(db_session)
+    with pytest.raises(AnalysisRepositoryError):
+        _reserve_analysis(AnalysisRepository(db_session), source, conversation, **change)
+    assert db_session.scalars(select(AnalysisRun)).all() == []
+
+
+def test_analysis_rejects_cross_account_wrong_membership_and_inactive_target(db_session):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    wrong = Conversation(account_scope="imap:one", stable_key=str(uuid4()),
+                         legacy_status="resolved", provenance="test")
+    db_session.add(wrong)
+    db_session.flush()
+    for scope, target_conversation in (("imap:two", conversation), ("imap:one", wrong)):
+        with pytest.raises(AnalysisRepositoryError):
+            _reserve_analysis(repo, source, target_conversation, scope=scope)
+    source.retention_state = "redacted"
+    db_session.flush()
+    with pytest.raises(AnalysisRepositoryError):
+        _reserve_analysis(repo, source, conversation)
+
+
+@pytest.mark.parametrize("legacy,superseded", [(True, False), (False, True)])
+def test_analysis_rejects_unresolved_or_superseded_conversation(db_session, legacy, superseded):
+    source, conversation = _analysis_target(db_session)
+    conversation.legacy_status = "legacy_unresolved" if legacy else "resolved"
+    conversation.account_scope = None if legacy else "imap:one"
+    conversation.superseded_at = datetime.now(timezone.utc) if superseded else None
+    db_session.flush()
+    with pytest.raises(AnalysisRepositoryError):
+        _reserve_analysis(AnalysisRepository(db_session), source, conversation)
+
+
+def test_analysis_supersession_stays_scoped_and_unique(db_session):
+    source, conversation = _analysis_target(db_session)
+    other_source, other_conversation = _analysis_target(db_session, scope="imap:two")
+    repo = AnalysisRepository(db_session)
+    first = _reserve_analysis(repo, source, conversation).run
+    other = _reserve_analysis(repo, other_source, other_conversation, scope="imap:two").run
+    repo.finalize_run_status(first.id)
+    repo.finalize_run_status(other.id)
+    successor = _reserve_analysis(repo, source, conversation, digest="b" * 64).run
+    repo.finalize_run_status(successor.id)
+    assert successor.supersedes_run_id == first.id
+    assert other.supersedes_run_id is None
+    assert successor.supersedes_run_id != successor.id
+    assert repo.latest_completed_run("imap:two", other_source.id).id == other.id
+    assert repo.run_history("imap:two", source.id) == ()
+    third = _reserve_analysis(repo, source, conversation, digest="c" * 64).run
+    with pytest.raises(IntegrityError):
+        with db_session.begin_nested():
+            third.supersedes_run_id = first.id
+            db_session.flush()
+
+
+def test_analysis_caller_owns_transaction_and_rollback(db_session, monkeypatch):
+    source, conversation = _analysis_target(db_session)
+    db_session.commit()  # Persist only the synthetic fixture rows.
+    repo = AnalysisRepository(db_session)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("repository owns no commit or rollback")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(db_session, "commit", forbidden)
+        patcher.setattr(db_session, "rollback", forbidden)
+        assert _reserve_analysis(repo, source, conversation).run.id is not None
+    db_session.rollback()
+    assert db_session.scalars(select(AnalysisRun)).all() == []
+
+
+def test_analysis_reservation_integrity_error_is_bounded(db_session, monkeypatch):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    original_flush = db_session.flush
+
+    def conflict(objects=None):
+        if objects and any(isinstance(row, AnalysisRun) for row in objects):
+            raise IntegrityError("INSERT", {}, Exception("private SQL detail"))
+        return original_flush(objects)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(db_session, "flush", conflict)
+        with pytest.raises(AnalysisRepositoryError) as error:
+            _reserve_analysis(repo, source, conversation)
+    assert error.value.code == "reservation_conflict"
+    assert "private SQL detail" not in str(error.value)
+
+
+def test_analysis_run_repository_does_not_create_derivations(db_session):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    run = _reserve_analysis(repo, source, conversation).run
+    repo.finalize_run_status(run.id)
+    for model in (AnalysisSourceEvidence, AnalysisDerivationLink,
+                  AnalysisSummary, AnalysisOperationalLink):
+        assert db_session.scalars(select(model)).all() == []
