@@ -83,11 +83,69 @@ def test_equivalent_relative_absolute_and_cwd_aliases(synthetic_db, monkeypatch)
 
 @pytest.mark.parametrize("identity", [
     "postgresql:///data.db", "sqlite:///:memory:", "sqlite:///data.db?uri=true",
-    "file:data.db", "sqlite:///missing.db", "sqlite://", "sqlite:////server/share/db",
+    "file:data.db", "sqlite://", "sqlite:////server/share/db", "sqlite:///con.db",
 ])
 def test_unsupported_database_forms_fail_closed(synthetic_db, identity):
     with pytest.raises(SingleInstanceError):
         SingleInstanceLock(identity)
+
+
+def test_missing_database_uses_canonical_parent_and_survives_creation(synthetic_db, monkeypatch):
+    root = synthetic_db.parent
+    missing = root / "future.db"
+    nested = root / "nested"
+    nested.mkdir()
+    monkeypatch.chdir(root)
+    relative = SingleInstanceLock("sqlite:///future.db")
+    assert not missing.exists()
+    assert relative.database_identity == SingleInstanceLock(missing).database_identity
+    monkeypatch.chdir(nested)
+    from_other_cwd = SingleInstanceLock("../future.db")
+    assert from_other_cwd.sidecar_path == relative.sidecar_path
+    with relative:
+        assert relative.is_owner
+        assert not missing.exists()  # Acquiring the sidecar never creates SQLite.
+        missing.write_bytes(b"synthetic")
+        existing = SingleInstanceLock(missing)
+        assert existing.database_identity == relative.database_identity
+        assert existing.sidecar_path == relative.sidecar_path
+        with pytest.raises(SingleInstanceError, match="already_locked"):
+            existing.acquire()
+    with SingleInstanceLock(missing) as replacement:
+        assert replacement.is_owner
+
+
+def test_missing_database_conflicts_across_processes(synthetic_db):
+    missing = synthetic_db.parent / "future.db"
+    process = _start_holder(missing, synthetic_db.parent / "future-ready")
+    try:
+        assert not missing.exists()
+        contender = SingleInstanceLock(missing)
+        with pytest.raises(SingleInstanceError, match="already_locked"):
+            contender.acquire()
+        assert not contender.is_owner
+    finally:
+        _stop(process)
+    with SingleInstanceLock(missing) as replacement:
+        assert replacement.is_owner
+        assert not missing.exists()
+
+
+def test_missing_parent_fails_closed(synthetic_db):
+    missing = synthetic_db.parent / "uncreated-parent" / "future.db"
+    with pytest.raises(SingleInstanceError, match="invalid_database_identity"):
+        SingleInstanceLock(missing)
+    assert not missing.parent.exists()
+
+
+def test_dangling_database_symlink_fails_closed(synthetic_db):
+    link = synthetic_db.parent / "future-link.db"
+    try:
+        link.symlink_to(synthetic_db.parent / "future-target.db")
+    except OSError:
+        pytest.skip("symlink creation unavailable to this Windows account")
+    with pytest.raises(SingleInstanceError, match="unsupported_database_identity"):
+        SingleInstanceLock(link)
 
 
 def test_second_process_refused_then_normal_release_and_stale_filename(synthetic_db):

@@ -48,15 +48,26 @@ def _database_path(database: str | Path) -> Path:
             raw.startswith("/") or "?" in raw or "#" in raw):
         raise SingleInstanceError("unsupported_database_identity")
     candidate = Path(raw)
-    if candidate.drive and not candidate.root:
+    if (candidate.drive and not candidate.root) or os.path.isreserved(candidate.name):
         raise SingleInstanceError("unsupported_database_identity")
     try:
         resolved = candidate.resolve(strict=True)
         info = resolved.stat()
+    except FileNotFoundError:
+        try:
+            if candidate.is_symlink():
+                raise SingleInstanceError("unsupported_database_identity")
+            parent = candidate.parent.resolve(strict=True)
+            if not parent.is_dir():
+                raise SingleInstanceError("invalid_database_identity")
+            resolved = parent / candidate.name
+        except (OSError, RuntimeError, ValueError):
+            raise SingleInstanceError("invalid_database_identity") from None
+        info = None
     except (OSError, RuntimeError, ValueError):
         raise SingleInstanceError("invalid_database_identity") from None
     if (not resolved.is_absolute() or not resolved.drive or not resolved.root or
-            not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+            (info is not None and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1))):
         raise SingleInstanceError("unsupported_database_identity")
     if _kernel32.GetDriveTypeW(resolved.anchor) != 3:  # DRIVE_FIXED
         raise SingleInstanceError("unsupported_storage")
