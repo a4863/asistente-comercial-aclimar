@@ -218,7 +218,7 @@ class OpenAIAnalysis:
                         elif code in _RATE_CODES:
                             category, transient = "provider_transient_exhausted", True
                         else:
-                            category, transient = "provider_quota", False
+                            category, transient = "provider_transient_exhausted", True
                     elif status in (401, 403) or isinstance(error, openai.AuthenticationError):
                         category, transient = "provider_auth", False
                     elif status == 402:

@@ -207,7 +207,7 @@ def test_non_json_and_oversize_output_fail_closed():
     (APIStatusError(403), "provider_auth"),
     (APIStatusError(402), "provider_quota"),
     (RateLimitError(429, "insufficient_quota"), "provider_quota"),
-    (RateLimitError(429), "provider_quota"),
+    (RateLimitError(429, "billing_hard_limit_reached"), "provider_quota"),
     (APIStatusError(400), "provider_failure"),
 ])
 def test_non_transient_errors_never_retry(error, code):
@@ -223,6 +223,8 @@ def test_non_transient_errors_never_retry(error, code):
     APIConnectionError("synthetic-secret-and-body"),
     APITimeoutError("synthetic-secret-and-body"),
     RateLimitError(429, "rate_limit_exceeded"),
+    RateLimitError(429),
+    APIStatusError(429, "unrecognized_provider_code"),
     APIStatusError(503),
 ])
 def test_transient_errors_retry_once(error):
@@ -239,8 +241,17 @@ def test_second_transient_failure_stops_after_two_attempts():
     assert len(factory.responses.calls) == 2
 
 
+def test_second_unclassified_429_stops_after_two_attempts_without_leak():
+    factory = FakeFactory([RateLimitError(429), RateLimitError(429)])
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory, sleep=lambda _: None).analyze(_input())
+    assert caught.value.code == "provider_transient_exhausted"
+    assert len(factory.responses.calls) == 2
+    assert "synthetic-secret-and-body" not in str(caught.value)
+
+
 def test_retry_after_exceeding_budget_prevents_second_attempt():
-    factory = FakeFactory([RateLimitError(429, "rate_limit_exceeded", "120")])
+    factory = FakeFactory([RateLimitError(429, None, "120")])
     with pytest.raises(OpenAIAnalysisError, match="provider_transient_exhausted"):
         _adapter(factory=factory, sleep=lambda _: None).analyze(_input())
     assert len(factory.responses.calls) == 1
