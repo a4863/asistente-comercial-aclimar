@@ -3,17 +3,23 @@
 from dataclasses import fields
 from datetime import datetime, timezone
 from hashlib import sha256
+import json
+import logging
+import sys
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
 
+from app.config import AISettings
 from app.domain.email_analysis import (
     AnalysisCandidates, AnalysisInput, AnalyticalSignalCandidate,
     CommitmentCandidate, ContextMention, EvidenceCandidate, FactCandidate,
     InferenceCandidate, NextStepCandidate, ProposalCandidate, QuestionCandidate,
     SupportRef, TaskCandidate, select_analysis_input,
 )
+from app.integrations.openai_analysis import OpenAIAnalysis
 from app.persistence.database import make_session_factory
 from app.persistence.models import (
     ActionProposal, Alert, AnalysisDerivationLink, AnalysisOperationalLink, AnalysisRun,
@@ -91,6 +97,149 @@ def _output(target_id, text="Need a quote?"):
 def _runs(factory):
     with factory() as session:
         return session.scalars(select(AnalysisRun).order_by(AnalysisRun.run_version)).all()
+
+
+def _remote_output(*, body="Need a quote?"):
+    evidence = {"message_alias": "m0", "start_offset": 0,
+                "end_offset": len(body), "exact_text": body}
+    return {"schema_version": 1, "summary": "A quote was requested.",
+            "facts": [{"fact_type": "request", "value_reference": "quote",
+                       "evidence": evidence}], "inferences": [], "proposals": [],
+            "questions": [{"question_text": body, "evidence": evidence}],
+            "commitments": [], "tasks": [], "next_steps": [],
+            "response_needed": None, "commercial_risk": None,
+            "priority": None, "context_mentions": []}
+
+
+def _remote_response(payload):
+    part = SimpleNamespace(type="output_text", text=json.dumps(payload))
+    return SimpleNamespace(status="completed", output=[SimpleNamespace(
+        type="message", role="assistant", content=[part])])
+
+
+class _OfflineOpenAI:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.factory_calls = []
+        self.calls = []
+        self.credentials = []
+
+    def get_secret(self, service, account):
+        self.credentials.append((service, account))
+        return "synthetic-test-key-only"
+
+    def __call__(self, **kwargs):
+        self.factory_calls.append(kwargs)
+        return SimpleNamespace(responses=self)
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        outcome = self.outcome() if callable(self.outcome) else self.outcome
+        if isinstance(outcome, Exception):
+            raise outcome
+        return _remote_response(outcome)
+
+    def adapter(self):
+        return OpenAIAnalysis(AISettings(enabled=True,
+                              base_url="https://eu.api.openai.com/v1"),
+                              self, client_factory=self)
+
+
+@pytest.fixture
+def _fake_openai_module(monkeypatch):
+    class ConnectionError(Exception):
+        pass
+
+    class TimeoutError(ConnectionError):
+        pass
+
+    class RateLimitError(Exception):
+        pass
+
+    class AuthenticationError(Exception):
+        pass
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(
+        APITimeoutError=TimeoutError, APIConnectionError=ConnectionError,
+        RateLimitError=RateLimitError, AuthenticationError=AuthenticationError))
+
+
+def test_concrete_openai_completes_replays_and_forces_new_run(analysis_db, _fake_openai_module):
+    target_id, _, _ = _seed(analysis_db)
+    remote = _OfflineOpenAI(_remote_output())
+    adapter = remote.adapter()
+    first = analyze_email_in_thread(analysis_db, adapter, "imap:test", target_id)
+    assert first.status == "completed" and len(remote.calls) == 1
+    assert analyze_email_in_thread(analysis_db, adapter, "imap:test", target_id).status == "completed_replay"
+    assert analyze_email_in_thread(analysis_db, adapter, "imap:test", target_id,
+                                   request_mode="manual").status == "completed_replay"
+    assert len(remote.calls) == len(remote.credentials) == 1
+    second = analyze_email_in_thread(analysis_db, adapter, "imap:test", target_id,
+                                     force_reanalysis=True)
+    assert second.status == "completed" and second.run_id != first.run_id
+    assert len(remote.calls) == len(remote.credentials) == 2
+    with analysis_db() as session:
+        assert [run.run_version for run in session.scalars(
+            select(AnalysisRun).order_by(AnalysisRun.run_version))] == [1, 2]
+        assert len(session.scalars(select(Question)).all()) == 2
+        assert session.scalars(select(ActionProposal)).all() == []
+
+
+@pytest.mark.parametrize("outcome, expected", [
+    (RuntimeError("provider body and synthetic-test-key-only"), "provider_failure"),
+    ({"schema_version": 1}, "provider_failure"),
+])
+def test_concrete_openai_failure_is_bounded_and_retryable(
+        analysis_db, _fake_openai_module, outcome, expected, caplog):
+    target_id, _, _ = _seed(analysis_db)
+    remote = _OfflineOpenAI(outcome)
+    caplog.set_level(logging.DEBUG)
+    result = analyze_email_in_thread(analysis_db, remote.adapter(), "imap:test", target_id)
+    assert (result.status, result.failure_code) == ("failed_retryable", expected)
+    assert len(remote.calls) == 1
+    assert "synthetic-test-key-only" not in repr(result)
+    assert "provider body" not in repr(result)
+    assert "synthetic-test-key-only" not in caplog.text
+    assert "provider body" not in caplog.text
+    assert _runs(analysis_db)[0].failure_code == expected
+    with analysis_db() as session:
+        assert session.scalars(select(AnalysisSourceEvidence)).all() == []
+    retry = _OfflineOpenAI(_remote_output())
+    again = analyze_email_in_thread(analysis_db, retry.adapter(), "imap:test", target_id)
+    assert again.status == "completed" and again.run_id != result.run_id
+    assert len(retry.calls) == 1
+
+
+def test_concrete_openai_stale_source_and_provider_outside_write_transaction(
+        analysis_db, _fake_openai_module):
+    target_id, _, _ = _seed(analysis_db)
+
+    def mutate_after_call():
+        with analysis_db.kw["bind"].connect() as connection:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            connection.exec_driver_sql("ROLLBACK")
+        with analysis_db() as session, session.begin():
+            email = session.scalar(select(EmailMessage).where(
+                EmailMessage.source_record_id == target_id))
+            email.normalized_body = "Changed after provider call"
+        return _remote_output()
+
+    remote = _OfflineOpenAI(mutate_after_call)
+    result = analyze_email_in_thread(analysis_db, remote.adapter(), "imap:test", target_id)
+    assert (result.status, result.failure_code) == ("stale_retryable", "input_changed")
+    assert len(remote.calls) == 1
+    with analysis_db() as session:
+        for model in (AnalysisSourceEvidence, ExtractedFact, Question):
+            assert session.scalars(select(model)).all() == []
+
+
+def test_concrete_openai_no_body_skips_client_and_credentials(analysis_db, _fake_openai_module):
+    target_id, _, _ = _seed(analysis_db, body=None)
+    remote = _OfflineOpenAI(_remote_output())
+    result = analyze_email_in_thread(analysis_db, remote.adapter(), "imap:test", target_id)
+    assert result.status == "no_analyzable_body"
+    assert remote.calls == remote.factory_calls == remote.credentials == []
+    assert _runs(analysis_db) == []
 
 
 def test_analysis_orchestrates_completion_replay_manual_and_force(analysis_db):
