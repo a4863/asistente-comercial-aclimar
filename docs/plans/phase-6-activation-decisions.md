@@ -123,3 +123,58 @@ Prepare an implementation plan with small, independently reviewable subphases. P
 - 6G — optional commercial-data activation, only after a separate processing-mode decision.
 
 No subphase is automatically approved by this decision record.
+
+
+## D8 — Commercial authorization state
+
+Approved:
+- Commercial authorization is **process-local**, revocable, and defaults to OFF.
+- Authorization does not persist across application restarts.
+- No authorization table or migration is introduced in this phase.
+- Restarting the application resets commercial authorization to OFF.
+- Synthetic smoke must use a separate synthetic-only execution path and must not provide a general bypass capable of carrying arbitrary commercial content.
+- Turning the provider technical switch on does not turn commercial authorization on.
+
+## D9 — Manual web trigger protection
+
+Approved:
+- The commercial manual trigger remains a local web/UI action.
+- A state-changing analysis POST must require:
+  - a valid local session;
+  - CSRF protection;
+  - origin/host validation appropriate to the localhost-only application.
+- Localhost alone is not treated as sufficient CSRF/authorization protection.
+- No commercial-analysis POST may be exposed before these controls exist and are covered by offline tests.
+- No CLI-based commercial trigger is introduced as a substitute in this phase.
+
+## D10 — Interrupted reserved-run recovery
+
+Approved:
+- Recovery of orphaned `AnalysisRun(status=reserved)` records is performed in a controlled startup recovery step before manual analysis becomes available.
+- Recovery must use the existing bounded state `failed_retryable / interrupted`.
+- Recovery must not blindly convert every reserved run.
+- The implementation must define and test an ownership/liveness/age rule sufficient to avoid marking a genuinely active request as interrupted.
+- Because the application is local single-user, prefer the smallest safe rule without introducing distributed coordination machinery.
+- Recovery must be atomic and idempotent.
+- If a safe orphan-detection rule cannot be derived from existing data, STOP rather than inventing one.
+
+## D11 — Synthetic smoke result retention
+
+Approved:
+- Synthetic smoke state is **transient and process-local** in Phase 6.
+- Do not persist smoke passed/failed history to SQLite.
+- No telemetry/smoke-history table or migration.
+- Status may display current-process `pending/passed/failed` only if the implementation can do so without creating a new persistence layer.
+- A previous successful smoke does not survive restart as an authorization fact.
+- Re-run the smoke when operationally required before a later commercial activation decision.
+
+## Consequence for the implementation plan
+
+The Phase 6 plan may now be finalized around these choices:
+- process-local commercial gate, OFF on restart;
+- protected localhost web trigger with local session + CSRF + origin/host validation;
+- startup orphaned-reservation recovery using existing run states and a proven safe detection rule;
+- transient smoke result only;
+- no new migration solely for authorization, smoke history, or provider telemetry.
+
+The remaining planning task is to produce exact per-subphase Scope Locks and STOP if the existing schema cannot safely distinguish orphaned reserved runs.
