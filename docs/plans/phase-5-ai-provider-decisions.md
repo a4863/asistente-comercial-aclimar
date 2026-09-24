@@ -12,11 +12,6 @@ Approved:
 - Model identifier: `gpt-6-sol`.
 - Model must remain non-secret configuration so a later approved change to another compatible model does not require an architectural rewrite.
 
-Rationale:
-- The project should start on the currently preferred high-capability model rather than depend on a lower-tier model that may have a shorter lifecycle.
-- Cost remains controlled by bounded input/output and local replay/idempotency.
-- Future downgrade/optimization remains a configuration decision, not an architecture change.
-
 ## D2 — API and transport
 
 Approved:
@@ -45,8 +40,14 @@ Approved:
 ## D5 — Provider data controls and region
 
 Approved:
-- Prefer European processing / EU endpoint where supported by the active OpenAI API project/account and compatible with the selected model.
-- Architecture must support provider-side data-control configuration without assuming the user's account has a particular entitlement such as Zero Data Retention.
+- European processing/residency remains the required condition for **real commercial-data activation** unless the user later gives a separate explicit approval for Global processing.
+- The currently configured API project does not expose an EU residency option; therefore no assumption of EU eligibility/residency is permitted.
+- This does **not** block offline implementation of the provider adapter.
+- Phase 5C may implement and test the adapter entirely with fake clients/SDK doubles and synthetic data while AI remains disabled for real use.
+- No live provider call, commercial-content transmission, or production activation is authorized by Phase 5C.
+- Any future live activation requires a separate approved task and one of:
+  1. verified EU eligibility/processing for the actual project/account, or
+  2. a new explicit user decision accepting Global processing.
 - No claim that ZDR or a specific residency mode is active until verified on the actual account/project.
 - Remote AI data remains governed by docs/security.md and docs/plans/remote-ai-data-policy.md.
 
