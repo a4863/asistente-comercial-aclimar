@@ -63,8 +63,10 @@ Approved:
 
 Approved:
 - No streaming.
-- Initial request timeout: 60 seconds.
-- Maximum automatic retry count: 1, only for explicitly transient provider/network/rate-limit/server failure classes.
+- Operational total-time budget: 60 seconds as a **soft overall deadline**, enforced locally with a monotonic clock.
+- The SDK/request timeout for each attempt must be capped to the remaining local budget.
+- This is not a hard real-time guarantee that the underlying OS/socket/process physically terminates at exactly 60.000 seconds.
+- Maximum automatic retry count: 1, only for explicitly transient provider/network/rate-limit/server failure classes and only while sufficient local budget remains.
 - No retry for authentication failure, quota/billing exhaustion, provider refusal, malformed output, policy failure, or local validation failure.
 - Single concurrent remote analysis request per process for the initial implementation.
 - Output must be bounded by strict schema plus a configurable provider output/token ceiling.
