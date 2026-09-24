@@ -178,3 +178,27 @@ The Phase 6 plan may now be finalized around these choices:
 - no new migration solely for authorization, smoke history, or provider telemetry.
 
 The remaining planning task is to produce exact per-subphase Scope Locks and STOP if the existing schema cannot safely distinguish orphaned reserved runs.
+
+
+## D12 — Single-instance operational ownership
+
+Approved:
+- The assistant is local, single-user and non-distributed; Phase 6 will prefer an **exclusive single-instance operational lock** over adding per-run process ownership fields.
+- Only one operational application instance may own the analysis execution capability at a time.
+- The operational instance must hold an exclusive local/OS-level lock for its entire lifetime.
+- A second instance must fail closed and must not expose manual analysis or call the provider.
+- No provider call may occur unless the current process/runtime proves ownership of the operational lock.
+- After acquiring the lock during controlled startup, and before enabling the manual trigger, inherited `AnalysisRun(status=reserved)` rows from the previous operational instance may be transitioned atomically/idempotently to `failed_retryable / interrupted`.
+- This design avoids adding PID/creation-time/heartbeat/lease fields to `AnalysisRun` unless single-instance ownership cannot be proven safely.
+- No migration is approved by this decision.
+- The design must be verified specifically on Windows and with the project's Uvicorn startup/reload behavior.
+- Do not assume that the reloader parent, child worker, or module import process is the correct lock owner without proving it.
+- If the Uvicorn/Windows process model prevents unambiguous lifetime ownership, STOP and return to a separately approved persistent per-run ownership design.
+- Any implementation must include tests for:
+  - second-instance refusal;
+  - zero provider calls without ownership;
+  - clean release on normal shutdown;
+  - restart reacquisition;
+  - startup recovery only after ownership is acquired;
+  - no duplicate recovery;
+  - interaction with development reload mode.
