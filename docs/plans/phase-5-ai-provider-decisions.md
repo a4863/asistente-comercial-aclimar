@@ -8,13 +8,14 @@
 
 Approved:
 - Provider: OpenAI API.
-- Initial model: GPT-6 Luna.
-- Model must remain non-secret configuration so a later approved change to GPT-6 Sol or another compatible model does not require an architectural rewrite.
+- Initial model: GPT-6 Sol.
+- Model identifier: `gpt-6-sol`.
+- Model must remain non-secret configuration so a later approved change to another compatible model does not require an architectural rewrite.
 
 Rationale:
-- Phase 5 begins with structured email/thread analysis.
-- Cost control is important for iterative testing.
-- Quality must be evaluated through project-specific evals rather than assumed.
+- The project should start on the currently preferred high-capability model rather than depend on a lower-tier model that may have a shorter lifecycle.
+- Cost remains controlled by bounded input/output and local replay/idempotency.
+- Future downgrade/optimization remains a configuration decision, not an architecture change.
 
 ## D2 — API and transport
 
@@ -84,7 +85,7 @@ Phase 5 must not weaken:
 
 ## Planning direction
 
-Plan Phase 5 in small increments, expected roughly as:
+Plan Phase 5 in small increments:
 - 5A provider-neutral remote projection/schema;
 - 5B non-secret config + credential reference;
 - 5C OpenAI adapter with fake transport/SDK tests;
