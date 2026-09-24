@@ -202,3 +202,26 @@ Approved:
   - startup recovery only after ownership is acquired;
   - no duplicate recovery;
   - interaction with development reload mode.
+
+
+## D13 — Windows single-instance lock mechanism
+
+Approved following `docs/plans/phase-6-single-instance-analysis.md`:
+
+- Use an exclusive Windows file handle opened with no sharing as the operational single-instance lock.
+- Implement with Windows APIs available through the Python standard library/ctypes; no new third-party locking dependency.
+- Lock identity must derive from the canonical absolute SQLite database identity, not working directory, application port or PID.
+- The lock handle must be non-inheritable and strongly held by the actual serving worker for the entire operational lifetime.
+- A stale sidecar filename has no ownership meaning; ownership is the live exclusive OS handle.
+- Failure to derive a safe canonical identity, open the lock location, or acquire exclusivity must fail startup closed for operational analysis.
+- The reloader parent must never count as operational owner.
+- Operational AI mode does not support Uvicorn `--reload` or multiple workers.
+- Development reload remains allowed only with operational AI/manual commercial analysis disabled.
+- No provider attempt or retry may occur without valid operational lock ownership plus the independent commercial authorization gate.
+- Startup recovery of inherited `reserved` runs may execute only after the operational lock is successfully acquired.
+- Shutdown must stop new analysis and ensure no provider work remains before releasing the lock.
+- A replacement process must acquire the OS lock before any recovery; delayed OS release after abnormal termination means temporary startup refusal, never permission to bypass the lock.
+- Before the first deployment of the lock-aware build, all pre-lock application instances/provider calls must be quiescent. Legacy ownerless reservations must not be swept merely because the new lock was acquired unless a separately approved quiescent recovery rule covers them.
+- If these constraints cannot be enforced or verified in implementation tests, STOP and fall back to separately approved persistent per-run ownership.
+
+This decision does not authorize live provider calls or commercial-data processing.
