@@ -14,6 +14,10 @@ from app.persistence.models import (
     ActivitySourceLink,
     Alert,
     AnalysisRun,
+    AnalysisSourceEvidence,
+    AnalysisDerivationLink,
+    AnalysisSummary,
+    AnalysisOperationalLink,
     ApprovalDecision,
     AuditEvent,
     Commitment,
@@ -148,13 +152,16 @@ class AnalysisReservation:
     run: AnalysisRun
 
 
-class AnalysisRepository:
-    """Phase 4C run identity/status only; the caller owns the transaction.
+@dataclass(frozen=True, slots=True)
+class AnalysisSourceSnapshot:
+    """Canonical selection and exact stored bodies captured before the provider call."""
 
-    This class does not persist derivations or implement complete_run. The
-    finalization helper must later be called in the same transaction as 4D's
-    validated derivation inserts.
-    """
+    analysis_input: object
+    original_bodies: tuple[tuple[int, str], ...]
+
+
+class AnalysisRepository:
+    """Phase 4 run identity, status and completion; caller owns the transaction."""
 
     _DIGEST = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
     _MODES = frozenset({"automatic", "manual", "force"})
@@ -332,6 +339,285 @@ class AnalysisRepository:
             # A uniqueness race is a bounded conflict; the caller rolls back.
             raise AnalysisRepositoryError("completion_conflict") from None
         return self.session.get(AnalysisRun, run_id, populate_existing=True)
+
+    def complete_run(self, run_id: int, expected_input_digest: str,
+                     validated_candidates, source_snapshot: AnalysisSourceSnapshot) -> AnalysisRun:
+        """Append one validated result without taking ownership of the transaction."""
+        from app.domain.email_analysis import (
+            AnalysisCandidates, AnalysisDomainError, AnalysisInput,
+            canonical_analysis_bytes, classify_quote, select_analysis_input,
+            validate_evidence,
+        )
+
+        self._id(run_id)
+        self._validate_input(expected_input_digest, 1, 1)
+        with self.session.no_autoflush:
+            run = self.session.get(AnalysisRun, run_id)
+        if run is None or run.status != "reserved":
+            raise AnalysisRepositoryError("run_state_conflict")
+        if run.input_digest != expected_input_digest:
+            raise AnalysisRepositoryError("input_changed")
+        if not isinstance(validated_candidates, AnalysisCandidates):
+            raise AnalysisRepositoryError("invalid_output")
+        if not isinstance(source_snapshot, AnalysisSourceSnapshot) or not isinstance(
+                source_snapshot.analysis_input, AnalysisInput):
+            raise AnalysisRepositoryError("invalid_snapshot")
+        analysis_input = source_snapshot.analysis_input
+        if (analysis_input.account_scope != run.account_scope
+                or analysis_input.target_source_record_id != run.target_source_record_id
+                or analysis_input.contract_version != run.contract_version
+                or analysis_input.policy_version != run.policy_version
+                or analysis_input.input_digest != run.input_digest):
+            raise AnalysisRepositoryError("input_changed")
+        try:
+            # Reconstruct the frozen aggregate to re-check even deliberately malformed DTOs.
+            AnalysisCandidates(**{name: getattr(validated_candidates, name)
+                                  for name in AnalysisCandidates.__dataclass_fields__})
+            canonical_digest = sha256(b"phase4/analysis-input/v1\0" + canonical_analysis_bytes(
+                analysis_input.account_scope, analysis_input.target_source_record_id,
+                analysis_input.contract_version, analysis_input.policy_version,
+                analysis_input.selected_messages)).hexdigest()
+            if canonical_digest != run.input_digest:
+                raise AnalysisRepositoryError("invalid_snapshot")
+            self._target(run.account_scope, run.target_source_record_id, run.conversation_id)
+            with self.session.no_autoflush:
+                current = select_analysis_input(
+                    self.session, run.account_scope, run.target_source_record_id,
+                    contract_version=run.contract_version, policy_version=run.policy_version)
+            if current != analysis_input:
+                raise AnalysisRepositoryError("input_changed")
+            bodies = dict(source_snapshot.original_bodies)
+            selected = {item.source_record_id: item for item in analysis_input.selected_messages}
+            if (len(bodies) != len(source_snapshot.original_bodies)
+                    or set(bodies) != set(selected)
+                    or any(type(body) is not str for body in bodies.values())):
+                raise AnalysisRepositoryError("invalid_snapshot")
+            with self.session.no_autoflush:
+                stored = self.session.execute(
+                    select(EmailMessage.source_record_id, EmailMessage.normalized_body)
+                    .where(EmailMessage.source_record_id.in_(selected))
+                ).all()
+            if dict(stored) != bodies:
+                raise AnalysisRepositoryError("input_changed")
+            if validated_candidates.summary is not None and any(
+                    validated_candidates.summary in (body, selected[source_id].body_excerpt)
+                    for source_id, body in bodies.items()):
+                raise AnalysisRepositoryError("invalid_summary")
+
+            evidence_candidates = []
+            for collection in (validated_candidates.facts, validated_candidates.inferences,
+                               validated_candidates.proposals, validated_candidates.questions,
+                               validated_candidates.commitments, validated_candidates.context_mentions):
+                evidence_candidates.extend(item.evidence for item in collection
+                                           if getattr(item, "evidence", None) is not None)
+            for signal in (validated_candidates.response_needed,
+                           validated_candidates.commercial_risk, validated_candidates.priority):
+                if signal is not None and signal.evidence is not None:
+                    evidence_candidates.append(signal.evidence)
+            evidence_keys = []
+            quote_states = {}
+            for evidence in evidence_candidates:
+                source_id = evidence.source_record_id
+                if source_id not in selected:
+                    raise AnalysisRepositoryError("invalid_evidence")
+                validate_evidence(evidence, bodies[source_id], selected[source_id])
+                key = (source_id, evidence.start_offset, evidence.end_offset,
+                       evidence.span_digest)
+                quote_states[key] = classify_quote(bodies[source_id], evidence)
+                if key not in evidence_keys:
+                    evidence_keys.append(key)
+            for question in validated_candidates.questions:
+                key = (question.evidence.source_record_id, question.evidence.start_offset,
+                       question.evidence.end_offset, question.evidence.span_digest)
+                if question.quote_state != quote_states[key]:
+                    raise AnalysisRepositoryError("invalid_quote_state")
+        except AnalysisDomainError:
+            raise AnalysisRepositoryError("invalid_output") from None
+
+        provenance = f"phase4:analysis_run:{run.id}"
+        evidence_rows = {}
+        pending_links = []
+        operational = []
+
+        def add_row(row):
+            self.session.add(row)
+            self.session.flush([row])
+            return row
+
+        def evidence_row(candidate):
+            if candidate is None:
+                return None
+            return evidence_rows[(candidate.source_record_id, candidate.start_offset,
+                                  candidate.end_offset, candidate.span_digest)]
+
+        def derive(kind, row, evidence=None):
+            pending_links.append((kind, row, evidence_row(evidence)))
+            return row
+
+        def resolved(ref):
+            if ref.kind == "fact":
+                return facts[ref.index]
+            if ref.kind == "inference":
+                return inferences[ref.index]
+            return proposals[ref.index]
+
+        try:
+            for source_id, start, end, span_digest in evidence_keys:
+                key = (source_id, start, end, span_digest)
+                evidence_rows[key] = add_row(AnalysisSourceEvidence(
+                    analysis_run_id=run.id, source_record_id=source_id,
+                    start_offset=start, end_offset=end,
+                    body_digest=selected[source_id].original_body_digest,
+                    span_digest=span_digest, quote_state=quote_states[key]))
+
+            facts = []
+            question_origins = []
+            commitment_origins = []
+            for candidate in validated_candidates.facts:
+                row = derive("fact", add_row(ExtractedFact(
+                    fact_type=candidate.fact_type, value_reference=candidate.value_reference,
+                    provenance=provenance)), candidate.evidence)
+                add_row(FactSourceEvidence(
+                    extracted_fact_id=row.id, source_record_id=candidate.evidence.source_record_id,
+                    evidence_reference=f"analysis_source_evidence:{evidence_row(candidate.evidence).id}"))
+                facts.append(row)
+            for question in validated_candidates.questions:
+                row = derive("fact", add_row(ExtractedFact(
+                    fact_type="question_asked",
+                    value_reference="sha256:" + sha256(question.question_text.encode("utf-8")).hexdigest(),
+                    provenance=provenance)), question.evidence)
+                add_row(FactSourceEvidence(
+                    extracted_fact_id=row.id, source_record_id=question.evidence.source_record_id,
+                    evidence_reference=f"analysis_source_evidence:{evidence_row(question.evidence).id}"))
+                question_origins.append(row)
+            for commitment in validated_candidates.commitments:
+                evidence = evidence_row(commitment.evidence)
+                if commitment.explicit_promise and evidence.quote_state == "new":
+                    row = derive("fact", add_row(ExtractedFact(
+                        fact_type="explicit_commitment", value_reference=commitment.description,
+                        provenance=provenance)), commitment.evidence)
+                    add_row(FactSourceEvidence(
+                        extracted_fact_id=row.id, source_record_id=commitment.evidence.source_record_id,
+                        evidence_reference=f"analysis_source_evidence:{evidence.id}"))
+                    commitment_origins.append(("fact", row))
+                else:
+                    commitment_origins.append(None)
+
+            inferences = []
+            for candidate in validated_candidates.inferences:
+                row = derive("inference", add_row(Inference(
+                    inference_type=candidate.inference_type,
+                    value_reference=candidate.value_reference, provenance=provenance)),
+                    candidate.evidence)
+                for ref in candidate.support_refs:
+                    add_row(InferenceSupport(inference_id=row.id, support_type="fact",
+                                             support_id=resolved(ref).id))
+                inferences.append(row)
+            for kind, signal in (("response_needed", validated_candidates.response_needed),
+                                 ("commercial_risk", validated_candidates.commercial_risk),
+                                 ("priority", validated_candidates.priority)):
+                if signal is None:
+                    continue
+                row = derive("inference", add_row(Inference(
+                    inference_type=kind, value_reference=signal.value,
+                    provenance=provenance)), signal.evidence)
+                for ref in signal.support_refs:
+                    add_row(InferenceSupport(inference_id=row.id, support_type="fact",
+                                             support_id=resolved(ref).id))
+                if signal.evidence is not None:
+                    add_row(InferenceSupport(inference_id=row.id, support_type="source",
+                                             support_id=signal.evidence.source_record_id))
+            for index, commitment in enumerate(validated_candidates.commitments):
+                if commitment_origins[index] is not None:
+                    continue
+                row = derive("inference", add_row(Inference(
+                    inference_type="possible_commitment",
+                    value_reference=commitment.description, provenance=provenance)),
+                    commitment.evidence)
+                add_row(InferenceSupport(inference_id=row.id, support_type="source",
+                                         support_id=commitment.evidence.source_record_id))
+                commitment_origins[index] = ("inference", row)
+
+            proposals = []
+            for candidate in validated_candidates.proposals:
+                row = derive("proposal", add_row(Proposal(
+                    proposal_type=candidate.proposal_type,
+                    value_reference=candidate.value_reference,
+                    provenance=provenance, status="proposed")), candidate.evidence)
+                for ref in candidate.support_refs:
+                    support = resolved(ref)
+                    add_row(ProposalSupport(proposal_id=row.id, support_type=ref.kind,
+                                            support_id=support.id))
+                proposals.append(row)
+            task_origins = []
+            next_origins = []
+            for collection, kind, origins in ((validated_candidates.tasks, "task", task_origins),
+                                               (validated_candidates.next_steps, "next_step", next_origins)):
+                for candidate in collection:
+                    value = candidate.title if kind == "task" else candidate.description
+                    row = derive("proposal", add_row(Proposal(
+                        proposal_type=kind, value_reference=value,
+                        provenance=provenance, status="proposed")))
+                    for ref in candidate.support_refs:
+                        support = resolved(ref)
+                        add_row(ProposalSupport(proposal_id=row.id, support_type=ref.kind,
+                                                support_id=support.id))
+                    origins.append(row)
+
+            links = {}
+            for kind, row, evidence in pending_links:
+                links[(kind, row.id)] = add_row(AnalysisDerivationLink(
+                    analysis_run_id=run.id, evidence_id=evidence.id if evidence else None,
+                    **{("extracted_fact_id" if kind == "fact" else kind + "_id"): row.id}))
+            if validated_candidates.summary is not None:
+                add_row(AnalysisSummary(
+                    analysis_run_id=run.id, summary_text=validated_candidates.summary,
+                    summary_digest=sha256(validated_candidates.summary.encode("utf-8")).hexdigest()))
+
+            for candidate, origin in zip(validated_candidates.questions, question_origins):
+                evidence = evidence_row(candidate.evidence)
+                if evidence.quote_state == "new" and evidence.source_record_id == run.target_source_record_id:
+                    row = add_row(Question(question_text=candidate.question_text,
+                                           state="detected", provenance=provenance))
+                    operational.append(("question", row, "fact", origin, candidate.evidence.source_record_id))
+            for candidate, origin in zip(validated_candidates.commitments, commitment_origins):
+                evidence = evidence_row(candidate.evidence)
+                state = "confirmed" if candidate.explicit_promise and evidence.quote_state == "new" else "detected"
+                row = add_row(Commitment(
+                    description=candidate.description, state=state,
+                    due_at=candidate.resolved_due_at,
+                    responsible_party=candidate.responsible_party,
+                    date_certainty=candidate.date_certainty,
+                    date_expression=candidate.date_expression,
+                    provenance=provenance))
+                operational.append(("commitment", row, origin[0], origin[1], candidate.evidence.source_record_id))
+            for candidate, origin in zip(validated_candidates.tasks, task_origins):
+                row = add_row(Task(title=candidate.title, due_at=candidate.due_at,
+                                   state="proposed", provenance=provenance))
+                operational.append(("task", row, "proposal", origin, None))
+            for candidate, origin in zip(validated_candidates.next_steps, next_origins):
+                row = add_row(NextStep(description=candidate.description, target_at=candidate.target_at,
+                                       state="proposed", provenance=provenance))
+                operational.append(("next_step", row, "proposal", origin, None))
+            for kind, row, origin_kind, origin, source_id in operational:
+                add_row(OperationalEvidenceLink(
+                    operational_type=kind, operational_id=row.id,
+                    evidence_type=origin_kind, evidence_id=origin.id,
+                    provenance=provenance))
+                if source_id is not None:
+                    add_row(OperationalEvidenceLink(
+                        operational_type=kind, operational_id=row.id,
+                        evidence_type="source", evidence_id=source_id,
+                        provenance=provenance))
+            for kind, row, origin_kind, origin, _ in operational:
+                add_row(AnalysisOperationalLink(
+                    analysis_run_id=run.id,
+                    derivation_link_id=links[(origin_kind, origin.id)].id,
+                    operational_type=kind, **{kind + "_id": row.id}))
+            self.session.flush()
+            return self.finalize_run_status(run.id)
+        except IntegrityError:
+            raise AnalysisRepositoryError("persistence_failure") from None
 
     def run_history(self, account_scope: str, target_source_record_id: int) -> tuple[AnalysisRun, ...]:
         self._scope(account_scope)

@@ -46,6 +46,7 @@ from app.persistence.repositories import (
     ActionRepository,
     AnalysisRepository,
     AnalysisRepositoryError,
+    AnalysisSourceSnapshot,
     AuditRepository,
     DerivationRepository,
     IMAPSyncRepository,
@@ -54,6 +55,13 @@ from app.persistence.repositories import (
     SourceRepository,
     ThreadPersistenceRepository,
 )
+from app.domain.email_analysis import (
+    AnalysisCandidates, AnalyticalSignalCandidate, CommitmentCandidate,
+    EvidenceCandidate, FactCandidate, InferenceCandidate, NextStepCandidate,
+    ProposalCandidate, QuestionCandidate, SupportRef, TaskCandidate,
+    select_analysis_input,
+)
+from app.persistence.models import ExtractedFact, Inference, Proposal, Question, NextStep
 
 
 def _source(db_session, external_id=None):
@@ -1278,3 +1286,175 @@ def test_analysis_run_repository_does_not_create_derivations(db_session):
     for model in (AnalysisSourceEvidence, AnalysisDerivationLink,
                   AnalysisSummary, AnalysisOperationalLink):
         assert db_session.scalars(select(model)).all() == []
+
+
+def _completion_fixture(db_session, body="Can you send a quote?\nI promise a reply.\n"):
+    source, conversation = _analysis_target(db_session)
+    email = db_session.scalar(select(EmailMessage).where(EmailMessage.source_record_id == source.id))
+    email.normalized_body = body
+    db_session.flush()
+    analysis_input = select_analysis_input(db_session, "imap:one", source.id)
+    snapshot = AnalysisSourceSnapshot(analysis_input, ((source.id, body),))
+    repo = AnalysisRepository(db_session)
+    run = _reserve_analysis(repo, source, conversation, digest=analysis_input.input_digest).run
+    return repo, run, snapshot
+
+
+def _span(source_id, body, text):
+    start = body.index(text)
+    return EvidenceCandidate(source_id, start, start + len(text),
+                             sha256(text.encode("utf-8")).hexdigest(), text)
+
+
+def test_analysis_completion_persists_typed_graph_and_operational_links(db_session):
+    body = "Can you send a quote?\nI promise a reply.\n"
+    repo, run, snapshot = _completion_fixture(db_session, body)
+    question = _span(run.target_source_record_id, body, "Can you send a quote?")
+    promise = _span(run.target_source_record_id, body, "I promise a reply.")
+    candidates = AnalysisCandidates(
+        summary="A quote was requested and a reply promised.",
+        facts=(FactCandidate("request", "quote", question),),
+        inferences=(InferenceCandidate("intent", "follow_up", (SupportRef("fact", 0),)),),
+        proposals=(ProposalCandidate("reply", "prepare_quote", (SupportRef("inference", 0),)),),
+        questions=(QuestionCandidate(question.exact_text, question, "new"),),
+        commitments=(CommitmentCandidate("Reply", "self", "none", None, None,
+                                         promise, True),),
+        tasks=(TaskCandidate("Prepare quote", None, (SupportRef("proposal", 0),)),),
+        next_steps=(NextStepCandidate("Send proposal", None, (SupportRef("proposal", 0),)),),
+        response_needed=AnalyticalSignalCandidate("yes", (SupportRef("fact", 0),)),
+    )
+    completed = repo.complete_run(run.id, run.input_digest, candidates, snapshot)
+    assert completed.status == "completed"
+    assert len(db_session.scalars(select(AnalysisSourceEvidence)).all()) == 2
+    assert len(db_session.scalars(select(ExtractedFact)).all()) == 3
+    assert len(db_session.scalars(select(Inference)).all()) == 2
+    assert len(db_session.scalars(select(Proposal)).all()) == 3
+    assert len(db_session.scalars(select(AnalysisDerivationLink)).all()) == 8
+    assert len(db_session.scalars(select(AnalysisOperationalLink)).all()) == 4
+    assert len(db_session.scalars(select(OperationalEvidenceLink)).all()) == 6
+    assert db_session.scalar(select(Question)).state == "detected"
+    assert db_session.scalar(select(Commitment)).state == "confirmed"
+    assert db_session.scalar(select(Task)).state == "proposed"
+    assert db_session.scalar(select(NextStep)).state == "proposed"
+    assert db_session.scalar(select(AnalysisSummary)).summary_digest == sha256(
+        candidates.summary.encode("utf-8")).hexdigest()
+    with pytest.raises(AnalysisRepositoryError):
+        repo.complete_run(run.id, run.input_digest, candidates, snapshot)
+
+
+@pytest.mark.parametrize("change", ["summary_copy", "wrong_digest", "wrong_source", "stale_body"])
+def test_analysis_completion_rejects_invalid_preconditions_without_rows(db_session, change):
+    repo, run, snapshot = _completion_fixture(db_session)
+    body = snapshot.original_bodies[0][1]
+    evidence = _span(run.target_source_record_id, body, "Can you send a quote?")
+    candidates = AnalysisCandidates(facts=(FactCandidate("request", "quote", evidence),))
+    digest = run.input_digest
+    if change == "summary_copy":
+        candidates = AnalysisCandidates(summary=body)
+    elif change == "wrong_digest":
+        digest = "b" * 64
+    elif change == "wrong_source":
+        wrong = EvidenceCandidate(9999, evidence.start_offset, evidence.end_offset,
+                                  evidence.span_digest, evidence.exact_text)
+        candidates = AnalysisCandidates(facts=(FactCandidate("request", "quote", wrong),))
+    else:
+        email = db_session.scalar(select(EmailMessage).where(
+            EmailMessage.source_record_id == run.target_source_record_id))
+        email.normalized_body = "changed"
+        db_session.flush()
+    with pytest.raises(AnalysisRepositoryError):
+        repo.complete_run(run.id, digest, candidates, snapshot)
+    assert run.status == "reserved"
+    assert db_session.scalars(select(AnalysisSourceEvidence)).all() == []
+    assert db_session.scalars(select(AnalysisDerivationLink)).all() == []
+
+
+@pytest.mark.parametrize("prefix,state,expected", [("> ", "quoted", 0),
+                                                    (" From: Alice\n", "ambiguous", 0),
+                                                    ("", "new", 1)])
+def test_analysis_question_quote_policy(db_session, prefix, state, expected):
+    body = prefix + "Can you send a quote?\n"
+    repo, run, snapshot = _completion_fixture(db_session, body)
+    evidence = _span(run.target_source_record_id, body, "Can you send a quote?")
+    candidates = AnalysisCandidates(questions=(QuestionCandidate(
+        evidence.exact_text, evidence, state),))
+    repo.complete_run(run.id, run.input_digest, candidates, snapshot)
+    assert len(db_session.scalars(select(Question)).all()) == expected
+    assert len(db_session.scalars(select(ExtractedFact)).all()) == 1
+
+
+def test_analysis_completion_reuses_span_and_supersedes_append_only(db_session):
+    repo, first, snapshot = _completion_fixture(db_session)
+    body = snapshot.original_bodies[0][1]
+    evidence = _span(first.target_source_record_id, body, "Can you send a quote?")
+    candidates = AnalysisCandidates(
+        facts=(FactCandidate("request", "quote", evidence),
+               FactCandidate("request_repeat", "quote", evidence)))
+    repo.complete_run(first.id, first.input_digest, candidates, snapshot)
+    assert len(db_session.scalars(select(AnalysisSourceEvidence)).all()) == 1
+    assert len(db_session.scalars(select(FactSourceEvidence)).all()) == 2
+    second = repo.reserve_run("imap:one", first.target_source_record_id,
+                              first.conversation_id, first.input_digest, 1, 1, "force").run
+    repo.complete_run(second.id, second.input_digest, candidates, snapshot)
+    assert second.supersedes_run_id == first.id
+    assert repo.run_provenance(first.id) == "superseded_analysis_needs_review"
+    assert len(db_session.scalars(select(ExtractedFact)).all()) == 4
+
+
+def test_analysis_completion_caller_owns_rollback_and_no_audit(db_session, monkeypatch):
+    repo, run, snapshot = _completion_fixture(db_session)
+    db_session.commit()
+    body = snapshot.original_bodies[0][1]
+    evidence = _span(run.target_source_record_id, body, "Can you send a quote?")
+    candidates = AnalysisCandidates(facts=(FactCandidate("request", "quote", evidence),))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("repository must not commit or rollback")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(db_session, "commit", forbidden)
+        patcher.setattr(db_session, "rollback", forbidden)
+        repo.complete_run(run.id, run.input_digest, candidates, snapshot)
+    assert db_session.scalars(select(AuditEvent)).all() == []
+    assert db_session.scalars(select(Alert)).all() == []
+    assert db_session.scalars(select(ApprovalDecision)).all() == []
+    assert db_session.scalars(select(ExecutionResult)).all() == []
+    db_session.rollback()
+    assert db_session.get(AnalysisRun, run.id).status == "reserved"
+    assert db_session.scalars(select(AnalysisSourceEvidence)).all() == []
+
+
+def test_analysis_completion_rejects_malformed_typed_support(db_session):
+    repo, run, snapshot = _completion_fixture(db_session)
+    body = snapshot.original_bodies[0][1]
+    evidence = _span(run.target_source_record_id, body, "Can you send a quote?")
+    candidate = InferenceCandidate("intent", "follow_up", (SupportRef("fact", 0),))
+    aggregate = AnalysisCandidates(
+        facts=(FactCandidate("request", "quote", evidence),),
+        inferences=(candidate,))
+    object.__setattr__(candidate, "support_refs", (SupportRef("proposal", 0),))
+    with pytest.raises(AnalysisRepositoryError) as error:
+        repo.complete_run(run.id, run.input_digest, aggregate, snapshot)
+    assert error.value.code == "invalid_output"
+    assert db_session.scalars(select(AnalysisSourceEvidence)).all() == []
+
+
+def test_analysis_completion_rejects_non_target_question_operational_creation(db_session):
+    repo, run, snapshot = _completion_fixture(db_session)
+    prior = SourceRecord(source_type="email_message", source_system_scope="imap:one",
+                         stable_external_id=str(uuid4()), provenance="test")
+    db_session.add(prior)
+    db_session.flush()
+    db_session.add_all((
+        EmailMessage(source_record_id=prior.id, normalized_body="Any update?", provenance="test"),
+        ConversationMembership(conversation_id=run.conversation_id,
+                               source_record_id=prior.id, evidence_type="test",
+                               evidence_reference="test"),
+    ))
+    db_session.flush()
+    # A newly selected prior invalidates the old input, before candidate persistence.
+    evidence = _span(prior.id, "Any update?", "Any update?")
+    candidate = AnalysisCandidates(questions=(QuestionCandidate("Any update?", evidence, "new"),))
+    with pytest.raises(AnalysisRepositoryError):
+        repo.complete_run(run.id, run.input_digest, candidate, snapshot)
+    assert db_session.scalars(select(Question)).all() == []
