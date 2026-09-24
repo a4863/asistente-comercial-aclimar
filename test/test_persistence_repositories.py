@@ -1458,3 +1458,82 @@ def test_analysis_completion_rejects_non_target_question_operational_creation(db
     with pytest.raises(AnalysisRepositoryError):
         repo.complete_run(run.id, run.input_digest, candidate, snapshot)
     assert db_session.scalars(select(Question)).all() == []
+
+
+def _completion_with_prior(db_session, prior_body):
+    prior = SourceRecord(source_type="email_message", source_system_scope="imap:one",
+                         stable_external_id=str(uuid4()), provenance="test")
+    db_session.add(prior)
+    db_session.flush()
+    source, conversation = _analysis_target(db_session)
+    db_session.add_all((
+        EmailMessage(source_record_id=prior.id, normalized_body=prior_body,
+                     subject="Prior context", provenance="test"),
+        ConversationMembership(conversation_id=conversation.id,
+                               source_record_id=prior.id, evidence_type="test",
+                               evidence_reference="test"),
+    ))
+    db_session.flush()
+    analysis_input = select_analysis_input(db_session, "imap:one", source.id)
+    snapshot = AnalysisSourceSnapshot(analysis_input, ((source.id, "body"),
+                                                       (prior.id, prior_body)))
+    repo = AnalysisRepository(db_session)
+    run = _reserve_analysis(repo, source, conversation,
+                            digest=analysis_input.input_digest).run
+    return repo, run, snapshot, prior
+
+
+def test_analysis_completion_accepts_metadata_only_prior_without_derived_rows(db_session):
+    repo, run, snapshot, prior = _completion_with_prior(db_session, None)
+    selected = snapshot.analysis_input.selected_messages
+    assert [item.source_record_id for item in selected] == [run.target_source_record_id,
+                                                            prior.id]
+    assert selected[1].role == "prior" and selected[1].body_excerpt == ""
+    assert selected[1].original_body_digest == sha256(b"").hexdigest()
+    assert snapshot.original_bodies[1] == (prior.id, None)
+    assert snapshot.analysis_input.input_digest == run.input_digest
+    completed = repo.complete_run(run.id, run.input_digest, AnalysisCandidates(), snapshot)
+    assert completed.status == "completed"
+    for model in (AnalysisSourceEvidence, AnalysisDerivationLink,
+                  AnalysisOperationalLink, ExtractedFact, Inference, Proposal,
+                  Question, Commitment, Task, NextStep):
+        assert db_session.scalars(select(model)).all() == []
+
+
+def test_analysis_completion_rejects_evidence_on_metadata_only_prior(db_session):
+    repo, run, snapshot, prior = _completion_with_prior(db_session, None)
+    evidence = EvidenceCandidate(prior.id, 0, 1, sha256(b"x").hexdigest(), "x")
+    candidates = AnalysisCandidates(facts=(FactCandidate("claim", "x", evidence),))
+    with pytest.raises(AnalysisRepositoryError) as error:
+        repo.complete_run(run.id, run.input_digest, candidates, snapshot)
+    assert error.value.code == "invalid_evidence"
+    assert run.status == "reserved"
+    assert db_session.scalars(select(AnalysisSourceEvidence)).all() == []
+
+
+@pytest.mark.parametrize("before,after", [(None, "new body"),
+                                           ("old body", None),
+                                           (None, ""),
+                                           ("", None)])
+def test_analysis_completion_detects_prior_body_state_change(db_session, before, after):
+    repo, run, snapshot, prior = _completion_with_prior(db_session, before)
+    email = db_session.scalar(select(EmailMessage).where(
+        EmailMessage.source_record_id == prior.id))
+    email.normalized_body = after
+    db_session.flush()
+    with pytest.raises(AnalysisRepositoryError) as error:
+        repo.complete_run(run.id, run.input_digest, AnalysisCandidates(), snapshot)
+    assert error.value.code == "input_changed"
+    assert run.status == "reserved"
+    assert db_session.scalars(select(AnalysisSourceEvidence)).all() == []
+
+
+def test_analysis_completion_keeps_text_prior_evidence_validation(db_session):
+    repo, run, snapshot, prior = _completion_with_prior(db_session, "Prior fact")
+    evidence = _span(prior.id, "Prior fact", "Prior fact")
+    candidates = AnalysisCandidates(facts=(FactCandidate("prior_fact", "known", evidence),))
+    repo.complete_run(run.id, run.input_digest, candidates, snapshot)
+    row = db_session.scalar(select(AnalysisSourceEvidence))
+    assert row.source_record_id == prior.id
+    assert row.body_digest == sha256(b"Prior fact").hexdigest()
+    assert db_session.scalar(select(FactSourceEvidence)).source_record_id == prior.id

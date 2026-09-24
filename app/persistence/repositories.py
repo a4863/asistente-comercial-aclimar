@@ -157,7 +157,7 @@ class AnalysisSourceSnapshot:
     """Canonical selection and exact stored bodies captured before the provider call."""
 
     analysis_input: object
-    original_bodies: tuple[tuple[int, str], ...]
+    original_bodies: tuple[tuple[int, str | None], ...]
 
 
 class AnalysisRepository:
@@ -390,7 +390,10 @@ class AnalysisRepository:
             selected = {item.source_record_id: item for item in analysis_input.selected_messages}
             if (len(bodies) != len(source_snapshot.original_bodies)
                     or set(bodies) != set(selected)
-                    or any(type(body) is not str for body in bodies.values())):
+                    or type(bodies[run.target_source_record_id]) is not str
+                    or any(type(body) is not str and not (
+                        body is None and selected[source_id].role == "prior")
+                        for source_id, body in bodies.items())):
                 raise AnalysisRepositoryError("invalid_snapshot")
             with self.session.no_autoflush:
                 stored = self.session.execute(
@@ -418,7 +421,7 @@ class AnalysisRepository:
             quote_states = {}
             for evidence in evidence_candidates:
                 source_id = evidence.source_record_id
-                if source_id not in selected:
+                if source_id not in selected or bodies[source_id] is None:
                     raise AnalysisRepositoryError("invalid_evidence")
                 validate_evidence(evidence, bodies[source_id], selected[source_id])
                 key = (source_id, evidence.start_offset, evidence.end_offset,
