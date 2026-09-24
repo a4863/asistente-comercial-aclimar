@@ -8,10 +8,11 @@ import pytest
 from sqlalchemy import event
 
 from app.domain.email_analysis import (
-    AnalysisCandidates, AnalysisDomainError, AnalysisInput, CommitmentCandidate,
+    AnalysisCandidates, AnalysisDomainError, AnalysisInput, AnalyticalSignalCandidate,
+    CommitmentCandidate,
     ContextMention, EvidenceCandidate, FactCandidate, InferenceCandidate,
     NextStepCandidate, NoAnalyzableBody, ProposalCandidate, QuestionCandidate,
-    SelectedMessage, TaskCandidate, canonical_analysis_bytes, classify_quote,
+    SelectedMessage, SupportRef, TaskCandidate, canonical_analysis_bytes, classify_quote,
     current_question_eligible, select_analysis_input, validate_evidence,
 )
 from app.persistence.models import Conversation, ConversationMembership, EmailMessage, SourceRecord
@@ -270,23 +271,31 @@ def test_conservative_quote_classification_and_current_question():
 ])
 def test_inference_enums_are_bounded(field, value):
     with pytest.raises(AnalysisDomainError):
-        AnalysisCandidates(**{field: value})
+        AnalysisCandidates(**{field: AnalyticalSignalCandidate(value, evidence=_span(1, "source", 0, 6))})
 
 
 def test_valid_candidates_and_immutable_collections():
     evidence = _span(1, "Question?", 0, 9)
+    fact_support = SupportRef("fact", 0)
+    inference_support = SupportRef("inference", 0)
+    proposal_support = SupportRef("proposal", 0)
     candidates = AnalysisCandidates(
         summary="A derived summary", facts=(FactCandidate("question", "?", evidence),),
-        inferences=(InferenceCandidate("risk", "low", (0,)),),
-        proposals=(ProposalCandidate("reply", "draft", (0,), evidence),),
+        inferences=(InferenceCandidate("risk", "low", (fact_support,)),),
+        proposals=(ProposalCandidate("reply", "draft", (fact_support, inference_support), evidence),),
         questions=(QuestionCandidate("Question?", evidence, "new"),),
         commitments=(CommitmentCandidate("promise", "self", "none", None, None, evidence, True),),
-        tasks=(TaskCandidate("follow up", None, (0,)),),
-        next_steps=(NextStepCandidate("reply", None, (0,)),),
-        response_needed="uncertain", commercial_risk="unknown", priority="normal",
+        tasks=(TaskCandidate("follow up", None, (proposal_support,)),),
+        next_steps=(NextStepCandidate("reply", None, (proposal_support,)),),
+        response_needed=AnalyticalSignalCandidate("uncertain", evidence=evidence),
+        commercial_risk=AnalyticalSignalCandidate("unknown", (fact_support,)),
+        priority=AnalyticalSignalCandidate("normal", (fact_support,)),
         context_mentions=(ContextMention("company", "ACME", evidence),),
     )
     assert candidates.facts[0].evidence == evidence
+    assert candidates.proposals[0].support_refs == (fact_support, inference_support)
+    assert candidates.tasks[0].support_refs == (proposal_support,)
+    assert candidates.response_needed.evidence == evidence
     with pytest.raises(FrozenInstanceError):
         candidates.summary = "changed"
     with pytest.raises(AnalysisDomainError):
@@ -327,8 +336,80 @@ def test_candidate_bounds_question_evidence_and_support_shape():
     with pytest.raises(AnalysisDomainError):
         QuestionCandidate("Question?", evidence, "unclear")
     with pytest.raises(AnalysisDomainError):
-        InferenceCandidate("risk", "low", (-1,))
+        InferenceCandidate("risk", "low", (-1,))  # No legacy integer coercion.
     with pytest.raises(AnalysisDomainError):
         ContextMention("unknown", "ACME", evidence)
     with pytest.raises(AnalysisDomainError):
         CommitmentCandidate("promise", "someone", "none", None, None, evidence, True)
+
+
+def test_typed_support_ref_shape_and_immutability():
+    valid = SupportRef("fact", 0)
+    assert valid.index == 0
+    with pytest.raises(FrozenInstanceError):
+        valid.kind = "proposal"
+    for kind, index in (("source", 0), ("fact", -1), ("fact", True)):
+        with pytest.raises(AnalysisDomainError):
+            SupportRef(kind, index)
+    with pytest.raises(AnalysisDomainError):
+        InferenceCandidate("risk", "low", (valid, valid))
+    with pytest.raises(AnalysisDomainError):
+        InferenceCandidate("risk", "low", [valid])
+
+
+def test_typed_support_resolution_rejects_out_of_range_and_wrong_kind():
+    evidence = _span(1, "fact", 0, 4)
+    fact = FactCandidate("statement", "fact", evidence)
+    valid_inference = InferenceCandidate("risk", "low", (SupportRef("fact", 0),))
+    valid_proposal = ProposalCandidate("reply", "draft", (SupportRef("inference", 0),))
+    assert AnalysisCandidates(facts=(fact,), inferences=(valid_inference,),
+                              proposals=(valid_proposal,)).proposals[0] == valid_proposal
+    invalid = (
+        {"inferences": (InferenceCandidate("risk", "low", (SupportRef("fact", 1),)),)},
+        {"facts": (fact,), "inferences": (InferenceCandidate("risk", "low", (SupportRef("inference", 0),)),)},
+        {"facts": (fact,), "proposals": (ProposalCandidate("reply", "draft", (SupportRef("proposal", 0),)),)},
+        {"facts": (fact,), "tasks": (TaskCandidate("act", None, (SupportRef("proposal", 0),)),)},
+        {"facts": (fact,), "next_steps": (NextStepCandidate("act", None, (SupportRef("inference", 0),)),)},
+    )
+    for values in invalid:
+        with pytest.raises(AnalysisDomainError):
+            AnalysisCandidates(**values)
+
+
+def test_support_order_is_preserved_and_no_integer_remapping():
+    evidence = _span(1, "fact", 0, 4)
+    facts = (FactCandidate("first", "one", evidence), FactCandidate("second", "two", evidence))
+    refs = (SupportRef("fact", 1), SupportRef("fact", 0))
+    result = AnalysisCandidates(facts=facts, inferences=(InferenceCandidate("risk", "low", refs),))
+    assert result.inferences[0].support_refs == refs
+    with pytest.raises(FrozenInstanceError):
+        result.inferences[0].support_refs = ()
+    with pytest.raises(AnalysisDomainError):
+        ProposalCandidate("reply", "draft", (0,))
+
+
+def test_signals_have_bounded_values_and_provenance():
+    evidence = _span(1, "source", 0, 6)
+    fact = FactCandidate("statement", "source", evidence)
+    ref = SupportRef("fact", 0)
+    result = AnalysisCandidates(
+        facts=(fact,),
+        response_needed=AnalyticalSignalCandidate("yes", evidence=evidence),
+        commercial_risk=AnalyticalSignalCandidate("medium", (ref,)),
+        priority=AnalyticalSignalCandidate("urgent", (ref,)),
+    )
+    assert result.response_needed.value == "yes"
+    assert result.commercial_risk.support_refs == (ref,)
+    assert result.priority.value == "urgent"
+    with pytest.raises(FrozenInstanceError):
+        result.priority.value = "low"
+    with pytest.raises(AnalysisDomainError):
+        AnalyticalSignalCandidate("yes")
+    with pytest.raises(AnalysisDomainError):
+        AnalysisCandidates(response_needed=AnalyticalSignalCandidate("yes", (ref,)))
+    with pytest.raises(AnalysisDomainError):
+        AnalysisCandidates(facts=(fact,), priority=AnalyticalSignalCandidate("high", (SupportRef("inference", 0),)))
+    with pytest.raises(AnalysisDomainError):
+        AnalysisCandidates(facts=(fact,), commercial_risk=AnalyticalSignalCandidate("medium", (ref, ref)))
+    with pytest.raises(AnalysisDomainError):
+        AnalysisCandidates(response_needed="yes")  # Scalar-only signal is no longer accepted.

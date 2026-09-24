@@ -303,8 +303,25 @@ def current_question_eligible(analysis_input: AnalysisInput, candidate: Evidence
     return classify_quote(original_body, candidate) == "new"
 
 
-def _support_indexes(indexes: tuple[int, ...]) -> None:
-    _require(type(indexes) is tuple and all(type(index) is int and index >= 0 for index in indexes))
+@dataclass(frozen=True, slots=True)
+class SupportRef:
+    """Zero-based index into the named AnalysisCandidates collection.
+
+    Tuple order is the provider's stable order; validation never sorts, drops,
+    remaps, or converts legacy integer indexes.
+    """
+
+    kind: Literal["fact", "inference", "proposal"]
+    index: int
+
+    def __post_init__(self):
+        _enum(self.kind, frozenset({"fact", "inference", "proposal"}))
+        _require(type(self.index) is int and self.index >= 0)
+
+
+def _support_refs(refs: tuple[SupportRef, ...]) -> None:
+    _require(type(refs) is tuple and all(isinstance(ref, SupportRef) for ref in refs))
+    _require(len(set(refs)) == len(refs))
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,13 +340,14 @@ class FactCandidate:
 class InferenceCandidate:
     inference_type: str
     value_reference: str
-    support_indexes: tuple[int, ...]
+    support_refs: tuple[SupportRef, ...]
     evidence: EvidenceCandidate | None = None
 
     def __post_init__(self):
         _text(self.inference_type, maximum=100)
         _text(self.value_reference, maximum=255)
-        _support_indexes(self.support_indexes)
+        _support_refs(self.support_refs)
+        _require(bool(self.support_refs))
         _require(self.evidence is None or isinstance(self.evidence, EvidenceCandidate))
 
 
@@ -337,13 +355,14 @@ class InferenceCandidate:
 class ProposalCandidate:
     proposal_type: str
     value_reference: str
-    support_indexes: tuple[int, ...]
+    support_refs: tuple[SupportRef, ...]
     evidence: EvidenceCandidate | None = None
 
     def __post_init__(self):
         _text(self.proposal_type, maximum=100)
         _text(self.value_reference, maximum=255)
-        _support_indexes(self.support_indexes)
+        _support_refs(self.support_refs)
+        _require(bool(self.support_refs))
         _require(self.evidence is None or isinstance(self.evidence, EvidenceCandidate))
 
 
@@ -390,24 +409,41 @@ class CommitmentCandidate:
 class TaskCandidate:
     title: str
     due_at: datetime | None
-    support_indexes: tuple[int, ...]
+    support_refs: tuple[SupportRef, ...]
 
     def __post_init__(self):
         _text(self.title, maximum=255)
         _require(self.due_at is None or isinstance(self.due_at, datetime))
-        _support_indexes(self.support_indexes)
+        _support_refs(self.support_refs)
+        _require(bool(self.support_refs))
 
 
 @dataclass(frozen=True, slots=True)
 class NextStepCandidate:
     description: str
     target_at: datetime | None
-    support_indexes: tuple[int, ...]
+    support_refs: tuple[SupportRef, ...]
 
     def __post_init__(self):
         _text(self.description, maximum=255)
         _require(self.target_at is None or isinstance(self.target_at, datetime))
-        _support_indexes(self.support_indexes)
+        _support_refs(self.support_refs)
+        _require(bool(self.support_refs))
+
+
+@dataclass(frozen=True, slots=True)
+class AnalyticalSignalCandidate:
+    """One bounded inference value with at least one provenance path."""
+
+    value: str
+    support_refs: tuple[SupportRef, ...] = ()
+    evidence: EvidenceCandidate | None = None
+
+    def __post_init__(self):
+        _text(self.value)
+        _support_refs(self.support_refs)
+        _require(self.evidence is None or isinstance(self.evidence, EvidenceCandidate))
+        _require(bool(self.support_refs) or self.evidence is not None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,9 +468,9 @@ class AnalysisCandidates:
     commitments: tuple[CommitmentCandidate, ...] = ()
     tasks: tuple[TaskCandidate, ...] = ()
     next_steps: tuple[NextStepCandidate, ...] = ()
-    response_needed: Literal["yes", "no", "uncertain"] | None = None
-    commercial_risk: Literal["none", "low", "medium", "high", "unknown"] | None = None
-    priority: Literal["low", "normal", "high", "urgent"] | None = None
+    response_needed: AnalyticalSignalCandidate | None = None
+    commercial_risk: AnalyticalSignalCandidate | None = None
+    priority: AnalyticalSignalCandidate | None = None
     context_mentions: tuple[ContextMention, ...] = ()
 
     def __post_init__(self):
@@ -447,9 +483,29 @@ class AnalysisCandidates:
             (self.next_steps, NextStepCandidate), (self.context_mentions, ContextMention),
         ):
             _require(type(field) is tuple and all(isinstance(item, kind) for item in field))
-        if self.response_needed is not None:
-            _enum(self.response_needed, frozenset({"yes", "no", "uncertain"}))
-        if self.commercial_risk is not None:
-            _enum(self.commercial_risk, frozenset({"none", "low", "medium", "high", "unknown"}))
-        if self.priority is not None:
-            _enum(self.priority, frozenset({"low", "normal", "high", "urgent"}))
+        collections = {
+            "fact": self.facts,
+            "inference": self.inferences,
+            "proposal": self.proposals,
+        }
+
+        def validate_supports(refs: tuple[SupportRef, ...], allowed: frozenset[str]) -> None:
+            for ref in refs:
+                _require(ref.kind in allowed)
+                _require(ref.index < len(collections[ref.kind]))
+
+        for candidate in self.inferences:
+            validate_supports(candidate.support_refs, frozenset({"fact"}))
+        for candidate in self.proposals:
+            validate_supports(candidate.support_refs, frozenset({"fact", "inference"}))
+        for candidate in (*self.tasks, *self.next_steps):
+            validate_supports(candidate.support_refs, frozenset({"fact", "inference", "proposal"}))
+        for signal, values in (
+            (self.response_needed, frozenset({"yes", "no", "uncertain"})),
+            (self.commercial_risk, frozenset({"none", "low", "medium", "high", "unknown"})),
+            (self.priority, frozenset({"low", "normal", "high", "urgent"})),
+        ):
+            if signal is not None:
+                _require(isinstance(signal, AnalyticalSignalCandidate))
+                _enum(signal.value, values)
+                validate_supports(signal.support_refs, frozenset({"fact"}))
