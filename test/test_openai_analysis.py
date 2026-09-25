@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
+import inspect
 import logging
 import sys
 import threading
@@ -399,3 +400,120 @@ def test_sensitive_content_and_bad_endpoint_never_touch_client():
         _adapter(factory=factory, settings=AISettings(enabled=True,
                  base_url="https://eu.api.openai.com/v1", max_retries=3)).analyze(_input())
     assert factory.kwargs == []
+
+
+def _smoke_adapter(*, settings=None, credentials=None, factory=None, ownership=None,
+                   commercial_gate=None, **kwargs):
+    return OpenAIAnalysis(settings or AISettings(enabled=True,
+                          base_url="https://eu.api.openai.com/v1"),
+                          credentials or FakeCredentials(),
+                          ownership=FakeOwnership() if ownership is None else ownership,
+                          commercial_gate=commercial_gate,
+                          client_factory=factory or FakeFactory(), **kwargs)
+
+
+def test_smoke_has_no_content_parameters_and_commercial_entry_still_requires_gate():
+    factory, credentials = FakeFactory(), FakeCredentials()
+    adapter = _smoke_adapter(factory=factory, credentials=credentials)
+    assert list(inspect.signature(adapter.smoke).parameters) == []
+    with pytest.raises(TypeError):
+        adapter.smoke(_input())
+    with pytest.raises(OpenAIAnalysisError, match="commercial_activation_required"):
+        adapter.analyze(_input())
+    assert credentials.calls == factory.kwargs == factory.responses.calls == []
+
+
+def test_smoke_fixed_projection_shared_schema_and_one_shot_without_gate_access():
+    class ForbiddenGate:
+        @property
+        def is_enabled(self):
+            pytest.fail("smoke inspected commercial gate")
+
+        def enable(self):
+            pytest.fail("smoke enabled commercial gate")
+
+        def disable(self):
+            pytest.fail("smoke disabled commercial gate")
+
+    credentials, factory = FakeCredentials(), FakeFactory()
+    settings = AISettings(enabled=True, model="gpt-6-sol",
+                          base_url="https://eu.api.openai.com/v1", max_output_tokens=900)
+    adapter = _smoke_adapter(settings=settings, credentials=credentials, factory=factory,
+                             commercial_gate=ForbiddenGate())
+    assert adapter.smoke() == "passed"
+    assert credentials.calls == [(settings.credential_service, settings.credential_account)]
+    assert factory.kwargs[0]["max_retries"] == 0
+    assert factory.kwargs[0]["base_url"] == settings.base_url
+    call = factory.responses.calls[0]
+    assert call["model"] == settings.model
+    assert call["store"] is False
+    assert call["max_output_tokens"] == 900
+    assert 0 < call["timeout"] <= 60
+    assert call["text"]["format"]["strict"] is True
+    assert call["text"]["format"]["schema"]["additionalProperties"] is False
+    assert not set(call) & {"tools", "tool_choice", "functions", "stream"}
+    assert call["input"] == [{"role": "user", "content": json.dumps({"messages": [{
+        "message_alias": "m0", "role": "target", "body_excerpt":
+        "This is a synthetic test message. Please confirm receipt of a sample catalogue request.",
+    }]}, ensure_ascii=False, separators=(",", ":"))}]
+    for forbidden in ("Need a quote?", "person@example.test", "imap:synthetic",
+                      "synthetic:smoke", "source_record_id", "input_digest"):
+        assert forbidden not in call["input"][0]["content"]
+    with pytest.raises(OpenAIAnalysisError, match="smoke_already_used"):
+        adapter.smoke()
+    assert len(factory.responses.calls) == 1
+
+
+@pytest.mark.parametrize("settings, ownership, code", [
+    (AISettings(), FakeOwnership(), "disabled"),
+    (AISettings(enabled=True), FakeOwnership(False), "operational_ownership_required"),
+])
+def test_smoke_preflight_fails_before_secret_or_client(settings, ownership, code):
+    credentials, factory = FakeCredentials(), FakeFactory()
+    adapter = _smoke_adapter(settings=settings, ownership=ownership,
+                             credentials=credentials, factory=factory)
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        adapter.smoke()
+    assert caught.value.code == code
+    assert credentials.calls == factory.kwargs == factory.responses.calls == []
+
+
+def test_smoke_revalidates_ownership_after_client_construction():
+    ownership, factory = FakeOwnership(), FakeFactory()
+
+    def release_during_factory(**kwargs):
+        result = factory(**kwargs)
+        ownership.is_owner = False
+        return result
+
+    adapter = OpenAIAnalysis(AISettings(enabled=True,
+                             base_url="https://eu.api.openai.com/v1"), FakeCredentials(),
+                             ownership=ownership, client_factory=release_during_factory)
+    with pytest.raises(OpenAIAnalysisError, match="operational_ownership_required"):
+        adapter.smoke()
+    assert len(factory.kwargs) == 1
+    assert factory.responses.calls == []
+
+
+def test_smoke_ownership_loss_after_retry_delay_blocks_second_attempt():
+    ownership = FakeOwnership()
+    factory = FakeFactory([APIConnectionError("synthetic-secret-and-body"), _response()])
+
+    def release(_delay):
+        ownership.is_owner = False
+
+    adapter = _smoke_adapter(factory=factory, ownership=ownership, sleep=release)
+    with pytest.raises(OpenAIAnalysisError, match="operational_ownership_required"):
+        adapter.smoke()
+    assert len(factory.responses.calls) == 1
+
+
+def test_smoke_provider_errors_are_bounded_and_do_not_leak():
+    factory = FakeFactory([APIStatusError(403)])
+    adapter = _smoke_adapter(factory=factory)
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        adapter.smoke()
+    assert caught.value.code == "provider_auth"
+    assert "synthetic-secret-and-body" not in str(caught.value) + repr(adapter)
+    with pytest.raises(OpenAIAnalysisError, match="smoke_already_used"):
+        adapter.smoke()

@@ -7,13 +7,16 @@ separately approved activation and verified data-control configuration.
 from __future__ import annotations
 
 from email.utils import parsedate_to_datetime
+from hashlib import sha256
 import json
 import threading
 import time
 from typing import Callable
 
 from app.config import AISettings
-from app.domain.email_analysis import AnalysisCandidates, AnalysisInput
+from app.domain.email_analysis import (
+    AnalysisCandidates, AnalysisInput, SelectedMessage, canonical_analysis_bytes,
+)
 from app.integrations.ai_schema import (
     AISchemaError, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, decode_analysis_response,
     project_analysis_input, response_schema,
@@ -41,6 +44,19 @@ _QUOTA_CODES = frozenset({
     "quota_exceeded", "billing_limit_exceeded",
 })
 _RATE_CODES = frozenset({"rate_limit_exceeded", "slow_down", "rate_limit_error"})
+_SMOKE_BODY = (
+    "This is a synthetic test message. Please confirm receipt of a sample catalogue request."
+)
+
+
+def _fixed_smoke_input() -> AnalysisInput:
+    message = SelectedMessage(1, "target", _SMOKE_BODY,
+                              sha256(_SMOKE_BODY.encode("utf-8")).hexdigest(),
+                              None, (), None, None)
+    messages = (message,)
+    digest = sha256(b"phase4/analysis-input/v1\0" + canonical_analysis_bytes(
+        "synthetic:smoke", 1, 1, 1, messages)).hexdigest()
+    return AnalysisInput("synthetic:smoke", 1, 1, 1, messages, digest)
 
 
 class OpenAIAnalysisError(RuntimeError):
@@ -147,17 +163,22 @@ class OpenAIAnalysis:
         self._clock = clock or time.monotonic
         self._sleep = sleep or time.sleep
         self._wall_clock = wall_clock or time.time
+        self._smoke_guard = threading.Lock()
+        self._smoke_used = False
 
     def __repr__(self) -> str:
         return "OpenAIAnalysis()"
 
-    def _require_authorization(self) -> None:
+    def _require_ownership(self) -> None:
         try:
             owned = self._ownership is not None and self._ownership.is_owner is True
         except Exception:
             owned = False
         if not owned:
             _raise("operational_ownership_required")
+
+    def _require_authorization(self) -> None:
+        self._require_ownership()
         try:
             authorized = (self._commercial_gate is not None and
                           self._commercial_gate.is_enabled is True)
@@ -167,10 +188,22 @@ class OpenAIAnalysis:
             _raise("commercial_activation_required")
 
     def analyze(self, analysis_input: AnalysisInput) -> AnalysisCandidates:
+        return self._execute(analysis_input, self._require_authorization)
+
+    def smoke(self) -> str:
+        with self._smoke_guard:
+            if self._smoke_used:
+                _raise("smoke_already_used")
+            self._smoke_used = True
+        self._execute(_fixed_smoke_input(), self._require_ownership)
+        return "passed"
+
+    def _execute(self, analysis_input: AnalysisInput,
+                 authorize: Callable[[], None]) -> AnalysisCandidates:
         settings = self._settings
         if not settings.enabled:
             _raise("disabled")
-        self._require_authorization()
+        authorize()
         if (settings.provider != "openai" or settings.base_url not in _ALLOWED_BASE_URLS or
                 type(settings.timeout_seconds) is not int or settings.timeout_seconds != 60 or
                 type(settings.max_retries) is not int or settings.max_retries != 1 or
@@ -216,7 +249,7 @@ class OpenAIAnalysis:
                 remaining = deadline - self._clock()
                 if remaining <= _MIN_ATTEMPT_SECONDS:
                     _raise("timeout")
-                self._require_authorization()
+                authorize()
                 try:
                     response = client.responses.create(
                         model=settings.model,
