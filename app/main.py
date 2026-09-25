@@ -4,7 +4,7 @@ import secrets
 from fastapi import FastAPI
 import uvicorn
 
-from app.config import Settings, load_settings
+from app.config import RuntimeConfigError, Settings, load_operational_settings, load_settings
 from app.persistence.database import make_session_factory
 from app.persistence.repositories import AnalysisRepository
 from app.security.activation import CommercialActivationGate
@@ -58,7 +58,13 @@ def create_app(settings: Settings | None = None, *, _operational: bool = False) 
 
 
 def run(settings: Settings | None = None) -> None:
-    configured_settings = settings or load_settings()
+    if settings is None:
+        try:
+            configured_settings = load_operational_settings()
+        except RuntimeConfigError:
+            raise SystemExit("configuration_unavailable") from None
+    else:
+        configured_settings = settings
     application = create_app(configured_settings, _operational=True)
     uvicorn.run(application, host=configured_settings.host, port=configured_settings.port,
                 reload=False, workers=1, lifespan="on")

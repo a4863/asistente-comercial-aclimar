@@ -2,7 +2,7 @@
 
 import sys
 
-from app.config import load_settings
+from app.config import load_operational_settings
 from app.integrations.openai_analysis import OpenAIAnalysis, OpenAIAnalysisError
 from app.security.credentials import KeyringCredentialStore
 from app.security.single_instance import SingleInstanceError, SingleInstanceLock
@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
         print("invalid_command", file=sys.stderr)
         return 2
     try:
-        settings = load_settings()
+        settings = load_operational_settings()
     except Exception:
         print("unavailable")
         return 1

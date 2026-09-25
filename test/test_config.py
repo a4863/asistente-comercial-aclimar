@@ -1,8 +1,13 @@
 from pathlib import Path
+from types import SimpleNamespace
+import ctypes
+import stat
+from uuid import UUID
 
 import pytest
 
-from app.config import load_settings
+from app import config
+from app.config import RuntimeConfigError, load_operational_settings, load_settings
 from app.integrations.ai_schema import MAX_REQUEST_BYTES
 
 
@@ -173,3 +178,142 @@ def test_settings_repr_contains_no_secret_value(isolated_tmp_path: Path):
     settings = _load_ai_toml(isolated_tmp_path,
                              'credential_service = "test.ai"\ncredential_account = "synthetic"')
     assert "synthetic-not-a-real-secret" not in repr(settings)
+
+
+@pytest.fixture
+def runtime_file(isolated_tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "_windows_local_appdata", lambda: isolated_tmp_path)
+    path = isolated_tmp_path / "ACLIMAR" / "Asistente Comercial" / "config.toml"
+    path.parent.mkdir(parents=True)
+    return path
+
+
+def _bounded_failure():
+    return pytest.raises(RuntimeConfigError, match="^configuration_unavailable$")
+
+
+def test_canonical_runtime_path_is_fixed_and_cwd_independent(runtime_file, monkeypatch):
+    runtime_file.write_text("", encoding="utf-8")
+    first = config.operational_config_path()
+    monkeypatch.chdir(runtime_file.parent)
+    assert config.operational_config_path() == first == runtime_file
+    assert load_operational_settings().ai.enabled is False
+    assert load_settings().ai.enabled is False
+
+
+@pytest.mark.parametrize("hresult", [0, -1])
+def test_windows_known_folder_api_uses_exact_guid_and_frees_result(
+        isolated_tmp_path, monkeypatch, hresult):
+    buffer = ctypes.create_unicode_buffer(str(isolated_tmp_path))
+    events = []
+
+    def known_folder(guid, flags, token, output):
+        raw_guid = bytes(ctypes.cast(guid, ctypes.POINTER(ctypes.c_ubyte * 16)).contents)
+        assert raw_guid == UUID("f1b32785-6fba-4fcf-9d55-7b8e7f157091").bytes_le
+        assert flags == 0 and token is None
+        ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.cast(
+            buffer, ctypes.c_void_p).value
+        events.append("get")
+        return hresult
+
+    def free(pointer):
+        assert pointer.value == ctypes.cast(buffer, ctypes.c_void_p).value
+        events.append("free")
+
+    shell = SimpleNamespace(SHGetKnownFolderPath=known_folder)
+    ole = SimpleNamespace(CoTaskMemFree=free)
+    monkeypatch.setattr(config.ctypes, "WinDLL", lambda name, **_kwargs: {
+        "shell32": shell, "ole32": ole}[name], raising=False)
+    if hresult:
+        with _bounded_failure():
+            config._windows_local_appdata()
+    else:
+        assert config._windows_local_appdata() == isolated_tmp_path
+    assert events == ["get", "free"]
+
+
+def test_known_folder_failure_never_uses_environment_fallback(runtime_file, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(runtime_file.parent))
+    monkeypatch.setattr(config, "_windows_local_appdata",
+                        lambda: (_ for _ in ()).throw(OSError("synthetic-path-secret")))
+    with _bounded_failure() as caught:
+        load_operational_settings()
+    assert "synthetic-path-secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "symlink", "device", "reparse"])
+def test_runtime_rejects_nonregular_or_redirected_file(runtime_file, monkeypatch, kind):
+    if kind == "directory":
+        runtime_file.mkdir()
+    elif kind in {"symlink", "device", "reparse"}:
+        runtime_file.write_text("", encoding="utf-8")
+        original = Path.lstat
+
+        def altered(path):
+            info = original(path)
+            if path == runtime_file:
+                return SimpleNamespace(
+                    st_mode=stat.S_IFLNK if kind == "symlink" else (
+                        stat.S_IFCHR if kind == "device" else stat.S_IFREG),
+                    st_file_attributes=(stat.FILE_ATTRIBUTE_REPARSE_POINT if kind == "reparse" else 0))
+            return info
+
+        monkeypatch.setattr(Path, "lstat", altered)
+    with _bounded_failure():
+        load_operational_settings()
+
+
+@pytest.mark.parametrize("content", [
+    b"\xff", b"[ai]\ninvalid = ", b"[secrets]\napi_key='synthetic-secret'",
+    b"api_key='synthetic-secret'", b"[server]\npassword='synthetic-secret'",
+    b"[database]\ntoken='synthetic-secret'", b"[imap]\npassword='synthetic-secret'",
+    b"[ai]\napi_key='synthetic-secret'", b"[server.extra]\nvalue=1",
+    b"[server]\nport=true", b"[database]\nurl=7", b"[imap]\nport=true",
+    b"[ai]\nenabled=true", b"[ai]\nenabled=true\nbase_url='https://evil.example/v1'",
+])
+def test_runtime_parser_fails_bounded_without_value_or_path(runtime_file, content):
+    runtime_file.write_bytes(content)
+    with _bounded_failure() as caught:
+        load_operational_settings()
+    assert str(runtime_file) not in str(caught.value)
+    assert "synthetic-secret" not in str(caught.value)
+
+
+def test_runtime_read_failure_is_bounded(runtime_file, monkeypatch):
+    runtime_file.write_text("", encoding="utf-8")
+    original = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == runtime_file:
+            raise PermissionError("synthetic-secret")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    with _bounded_failure() as caught:
+        load_operational_settings()
+    assert "synthetic-secret" not in str(caught.value)
+
+
+def test_runtime_valid_closed_schema_and_allowlisted_ai(runtime_file):
+    runtime_file.write_text('''[server]
+host = "127.0.0.1"
+port = 8123
+[database]
+url = "sqlite:///synthetic.db"
+[imap]
+host = "imap.example.test"
+port = 993
+[ai]
+enabled = true
+provider = "openai"
+model = "gpt-6-sol"
+base_url = "https://eu.api.openai.com/v1"
+credential_service = "synthetic.ai"
+credential_account = "synthetic-user"
+''', encoding="utf-8")
+    settings = load_operational_settings()
+    assert settings.port == 8123 and settings.database_url == "sqlite:///synthetic.db"
+    assert settings.imap.host == "imap.example.test"
+    assert settings.ai.enabled and settings.ai.base_url == "https://eu.api.openai.com/v1"
+    assert (settings.ai.credential_service, settings.ai.credential_account) == (
+        "synthetic.ai", "synthetic-user")

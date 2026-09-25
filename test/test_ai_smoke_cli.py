@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app import config
 from app.config import AISettings
 from app.integrations import ai_smoke_cli
 from app.integrations.openai_analysis import OpenAIAnalysisError
@@ -46,7 +47,7 @@ def smoke_fakes(monkeypatch):
     class FakeCredentials:
         pass
 
-    monkeypatch.setattr(ai_smoke_cli, "load_settings", lambda: settings)
+    monkeypatch.setattr(ai_smoke_cli, "load_operational_settings", lambda: settings)
     monkeypatch.setattr(ai_smoke_cli, "SingleInstanceLock", FakeLock)
     monkeypatch.setattr(ai_smoke_cli, "KeyringCredentialStore", FakeCredentials)
     monkeypatch.setattr(ai_smoke_cli, "OpenAIAnalysis", FakeAdapter)
@@ -146,3 +147,62 @@ def test_cli_has_no_commercial_gate_or_database_session_access(smoke_fakes, monk
     monkeypatch.setattr(CommercialActivationGate, "enable", forbidden)
     monkeypatch.setattr(CommercialActivationGate, "disable", forbidden)
     assert ai_smoke_cli.main([]) == 0
+
+
+def test_smoke_uses_canonical_configured_settings_with_fake_provider(
+        smoke_fakes, isolated_tmp_path, monkeypatch, capsys):
+    events, _settings = smoke_fakes
+    path = isolated_tmp_path / "ACLIMAR" / "Asistente Comercial" / "config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text('[database]\nurl="sqlite:///synthetic-smoke.db"\n'
+                    '[ai]\nenabled=true\nbase_url="https://eu.api.openai.com/v1"\n',
+                    encoding="utf-8")
+    monkeypatch.setattr(config, "_windows_local_appdata", lambda: isolated_tmp_path)
+    monkeypatch.setattr(ai_smoke_cli, "load_operational_settings", config.load_operational_settings)
+
+    class ConfiguredFakeAdapter:
+        def __init__(self, ai, _credentials, *, ownership):
+            assert ai.enabled and ai.base_url == "https://eu.api.openai.com/v1"
+            assert ownership.is_owner
+            events.append("adapter_construct")
+
+        def smoke(self):
+            events.append("smoke")
+            return "passed"
+
+    monkeypatch.setattr(ai_smoke_cli, "OpenAIAnalysis", ConfiguredFakeAdapter)
+    assert ai_smoke_cli.main([]) == 0
+    assert capsys.readouterr().out == "passed\n"
+    assert events == ["lock_construct", "lock_acquire", "adapter_construct",
+                      "smoke", "lock_release"]
+
+
+@pytest.mark.parametrize("content,expected", [
+    (None, "unavailable"),
+    ('[ai]\napi_key="synthetic-secret"\n', "unavailable"),
+    ('[ai]\nenabled=true\nbase_url="https://evil.example/v1"\n', "unavailable"),
+    ('[ai]\nenabled=false\n', "disabled"),
+])
+def test_smoke_invalid_or_disabled_canonical_config_never_reaches_lock_or_provider(
+        smoke_fakes, isolated_tmp_path, monkeypatch, capsys, content, expected):
+    events, _settings = smoke_fakes
+    path = isolated_tmp_path / "ACLIMAR" / "Asistente Comercial" / "config.toml"
+    path.parent.mkdir(parents=True)
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(config, "_windows_local_appdata", lambda: isolated_tmp_path)
+    monkeypatch.setattr(ai_smoke_cli, "load_operational_settings", config.load_operational_settings)
+    monkeypatch.setattr(ai_smoke_cli, "KeyringCredentialStore",
+                        lambda: pytest.fail("keyring before valid configuration"))
+    assert ai_smoke_cli.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == expected + "\n" and captured.err == ""
+    assert events == []
+    assert "synthetic-secret" not in captured.out + captured.err
+
+
+def test_smoke_help_and_bad_arguments_never_discover_config(monkeypatch):
+    monkeypatch.setattr(ai_smoke_cli, "load_operational_settings",
+                        lambda: pytest.fail("configuration discovered"))
+    assert ai_smoke_cli.main(["--help"]) == 0
+    assert ai_smoke_cli.main(["--config", "synthetic.toml"]) == 2

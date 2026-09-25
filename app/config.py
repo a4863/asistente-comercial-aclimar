@@ -1,16 +1,20 @@
 from dataclasses import dataclass
+import ctypes
+import stat
+import sys
 import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
+from uuid import UUID
 
 
-_IMAP_SECRET_KEYS = {
-    "password",
-    "app_password",
-    "secret",
-    "token",
-    "access_token",
-    "refresh_token",
+_TABLE_KEYS = {
+    "server": {"host", "port"},
+    "database": {"url"},
+    "imap": {"host", "port", "account", "account_scope", "folder_allowlist",
+             "initial_window_days", "max_body_bytes", "credential_service", "credential_account"},
+    "ai": {"enabled", "provider", "model", "base_url", "timeout_seconds", "max_retries",
+           "max_output_tokens", "max_request_bytes", "credential_service", "credential_account"},
 }
 
 _AI_KEYS = {
@@ -18,6 +22,75 @@ _AI_KEYS = {
     "max_output_tokens", "max_request_bytes", "credential_service", "credential_account",
 }
 _AI_REQUEST_BYTE_CEILING = 160_000  # Phase 5A's fixed local projection ceiling.
+_ALLOWED_AI_ENDPOINTS = frozenset({"https://api.openai.com/v1", "https://eu.api.openai.com/v1"})
+
+
+class RuntimeConfigError(ValueError):
+    def __init__(self):
+        super().__init__("configuration_unavailable")
+
+
+def _windows_local_appdata() -> Path:
+    if sys.platform != "win32":
+        raise RuntimeConfigError() from None
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+    result = ctypes.c_void_p()
+    try:
+        folder_id = GUID.from_buffer_copy(UUID("f1b32785-6fba-4fcf-9d55-7b8e7f157091").bytes_le)
+        shell = ctypes.WinDLL("shell32", use_last_error=True)
+        shell.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), ctypes.c_uint32,
+                                               ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        shell.SHGetKnownFolderPath.restype = ctypes.c_long
+        ole = ctypes.WinDLL("ole32", use_last_error=True)
+        ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+        ole.CoTaskMemFree.restype = None
+        try:
+            status = shell.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(result))
+            if status != 0 or not result.value:
+                raise RuntimeConfigError()
+            folder = ctypes.wstring_at(result.value)
+        finally:
+            if result.value:
+                ole.CoTaskMemFree(result)
+        path = Path(folder)
+        if not folder or not path.is_absolute():
+            raise RuntimeConfigError()
+        return path
+    except Exception:
+        raise RuntimeConfigError() from None
+
+
+def operational_config_path() -> Path:
+    try:
+        base = _windows_local_appdata()
+        if not isinstance(base, Path) or not base.is_absolute():
+            raise RuntimeConfigError()
+        current = base
+        for component in ("ACLIMAR", "Asistente Comercial", "config.toml"):
+            current = current / component
+            info = current.lstat()
+            if (stat.S_ISLNK(info.st_mode) or
+                    getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                raise RuntimeConfigError()
+            if component == "config.toml":
+                if not stat.S_ISREG(info.st_mode):
+                    raise RuntimeConfigError()
+            elif not stat.S_ISDIR(info.st_mode):
+                raise RuntimeConfigError()
+        return current
+    except Exception:
+        raise RuntimeConfigError() from None
+
+
+def load_operational_settings() -> "Settings":
+    try:
+        return load_settings(operational_config_path())
+    except Exception:
+        raise RuntimeConfigError() from None
 
 
 @dataclass(frozen=True)
@@ -57,15 +130,12 @@ class Settings:
 
 
 def _require_nonempty(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str or not value.strip():
         raise ValueError(f"imap {field} must not be empty")
     return value
 
 
 def _load_imap_settings(values: dict) -> IMAPSettings:
-    secret_keys = _IMAP_SECRET_KEYS & set(values)
-    if secret_keys:
-        raise ValueError("imap secrets must not be stored in TOML")
     defaults = IMAPSettings()
     folders = values.get("folder_allowlist", defaults.folder_allowlist)
     if not isinstance(folders, list) and not isinstance(folders, tuple):
@@ -77,11 +147,11 @@ def _load_imap_settings(values: dict) -> IMAPSettings:
     port = values.get("port", defaults.port)
     initial_window_days = values.get("initial_window_days", defaults.initial_window_days)
     max_body_bytes = values.get("max_body_bytes", defaults.max_body_bytes)
-    if not isinstance(port, int) or port <= 0:
+    if type(port) is not int or port <= 0:
         raise ValueError("imap port must be positive")
-    if not isinstance(initial_window_days, int) or initial_window_days < 0:
+    if type(initial_window_days) is not int or initial_window_days < 0:
         raise ValueError("imap initial_window_days must be non-negative")
-    if not isinstance(max_body_bytes, int) or max_body_bytes <= 0:
+    if type(max_body_bytes) is not int or max_body_bytes <= 0:
         raise ValueError("imap max_body_bytes must be positive")
     return IMAPSettings(
         host=_require_nonempty(values.get("host", defaults.host), "host"),
@@ -144,6 +214,8 @@ def _load_ai_settings(values: dict) -> AISettings:
     base_url = _ai_url(values.get("base_url", defaults.base_url))
     if enabled and base_url is None:
         raise ValueError("invalid ai configuration")
+    if enabled and base_url not in _ALLOWED_AI_ENDPOINTS:
+        raise ValueError("invalid ai configuration")
     return AISettings(
         enabled=enabled, provider=provider, model=model, base_url=base_url,
         timeout_seconds=_ai_integer(values.get("timeout_seconds", defaults.timeout_seconds), expected=60),
@@ -161,15 +233,22 @@ def load_settings(path: Path | None = None) -> Settings:
         data = {} if path is None else tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError:
         raise ValueError("invalid TOML configuration") from None
+    if not isinstance(data, dict) or set(data) - set(_TABLE_KEYS):
+        raise ValueError("invalid configuration")
+    for table, values in data.items():
+        if not isinstance(values, dict) or set(values) - _TABLE_KEYS[table]:
+            raise ValueError("invalid ai configuration" if table == "ai" else "invalid configuration")
     server, database, imap, ai = (data.get("server", {}), data.get("database", {}),
                                   data.get("imap", {}), data.get("ai", {}))
     host = server.get("host", "127.0.0.1")
     if host != "127.0.0.1":
         raise ValueError("The application must bind only to 127.0.0.1")
-    if not isinstance(imap, dict):
-        raise ValueError("imap configuration must be a table")
-    if not isinstance(ai, dict):
-        raise ValueError("invalid ai configuration")
-    return Settings(host, int(server.get("port", 8000)),
-                    database.get("url", "sqlite:///assistant.db"),
+    port = server.get("port", 8000)
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("invalid configuration")
+    database_url = database.get("url", "sqlite:///assistant.db")
+    if type(database_url) is not str or not database_url.strip():
+        raise ValueError("invalid configuration")
+    return Settings(host, port,
+                    database_url,
                     _load_imap_settings(imap), _load_ai_settings(ai))

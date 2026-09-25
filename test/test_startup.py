@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 
-from app.config import Settings
+from app.config import RuntimeConfigError, Settings
 from app.main import app as direct_uvicorn_app, create_app, run
 from app.persistence.database import make_session_factory
 from app.persistence.models import (
@@ -99,6 +99,40 @@ def test_controlled_launcher_uses_validated_loopback_settings(monkeypatch):
                         "workers": 1, "lifespan": "on"}
 
 
+def test_controlled_launcher_loads_operational_settings_once(monkeypatch):
+    settings = Settings(port=8123, database_url="sqlite:///synthetic-runtime.db")
+    loads = []
+    calls = []
+    monkeypatch.setattr("app.main.load_operational_settings",
+                        lambda: loads.append("load") or settings)
+    monkeypatch.setattr("app.main.uvicorn.run", lambda *args, **kwargs: calls.append((args, kwargs)))
+    run()
+    assert loads == ["load"] and len(calls) == 1
+    assert calls[0][0][0].state.settings is settings
+    assert calls[0][1]["port"] == 8123
+
+
+def test_explicit_settings_bypass_operational_discovery(monkeypatch):
+    monkeypatch.setattr("app.main.load_operational_settings",
+                        lambda: pytest.fail("ambient runtime discovery"))
+    monkeypatch.setattr("app.main.uvicorn.run", lambda *_args, **_kwargs: None)
+    run(Settings())
+    inert = create_app()
+    assert inert.state.settings.ai.enabled is False
+
+
+def test_runtime_config_failure_stops_before_app_and_uvicorn(monkeypatch):
+    def unavailable():
+        raise RuntimeConfigError()
+
+    monkeypatch.setattr("app.main.load_operational_settings", unavailable)
+    monkeypatch.setattr("app.main.create_app", lambda *_args, **_kwargs: pytest.fail("app created"))
+    monkeypatch.setattr("app.main.uvicorn.run", lambda *_args, **_kwargs: pytest.fail("server started"))
+    with pytest.raises(SystemExit, match="^configuration_unavailable$") as caught:
+        run()
+    assert caught.value.code == "configuration_unavailable"
+
+
 def test_controlled_launcher_rejects_non_loopback_settings(monkeypatch):
     monkeypatch.setattr("app.main.uvicorn.run", lambda *args, **kwargs: pytest.fail("must not run"))
 
@@ -109,8 +143,10 @@ def test_controlled_launcher_rejects_non_loopback_settings(monkeypatch):
 def test_import_and_default_create_app_do_not_acquire_lock(monkeypatch):
     code = (
         "import app.security.single_instance as lock\n"
+        "import app.config as config\n"
         "def forbidden(*args, **kwargs): raise AssertionError('lock on import')\n"
         "lock.SingleInstanceLock = forbidden\n"
+        "config._windows_local_appdata = forbidden\n"
         "import app.main\n"
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True,

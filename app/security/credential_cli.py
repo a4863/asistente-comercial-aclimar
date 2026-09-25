@@ -3,7 +3,7 @@
 import getpass
 import sys
 
-from app.config import load_settings
+from app.config import load_operational_settings
 from app.security.credentials import KeyringCredentialStore
 
 
@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     action = arguments[0]
     try:
-        ai = load_settings().ai
+        ai = load_operational_settings().ai
         store = KeyringCredentialStore()
     except Exception:
         print("unavailable")
