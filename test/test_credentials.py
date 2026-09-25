@@ -64,3 +64,23 @@ def test_fake_keyring_error_does_not_expose_secret(monkeypatch):
     with pytest.raises(RuntimeError) as caught:
         KeyringCredentialStore().get_secret("test.ai", "synthetic")
     assert "synthetic-ai-secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("secret,expected", [
+    ("synthetic-status-secret", "present"), (None, "missing"), ("", "missing"),
+    (object(), "unavailable"),
+])
+def test_credential_presence_returns_only_bounded_state(monkeypatch, secret, expected):
+    monkeypatch.setitem(sys.modules, "keyring", SimpleNamespace(
+        get_password=lambda service, account: secret))
+    result = KeyringCredentialStore().credential_presence("test.ai", "synthetic")
+    assert result == expected
+    assert "synthetic-status-secret" not in result
+
+
+def test_credential_presence_catches_backend_failure_without_error_text(monkeypatch):
+    def fail(_service, _account):
+        raise RuntimeError("synthetic-status-secret and backend details")
+
+    monkeypatch.setitem(sys.modules, "keyring", SimpleNamespace(get_password=fail))
+    assert KeyringCredentialStore().credential_presence("test.ai", "synthetic") == "unavailable"

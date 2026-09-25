@@ -6,6 +6,8 @@ import uvicorn
 from app.config import Settings, load_settings
 from app.persistence.database import make_session_factory
 from app.persistence.repositories import AnalysisRepository
+from app.security.activation import CommercialActivationGate
+from app.security.credentials import KeyringCredentialStore
 from app.security.single_instance import SingleInstanceLock
 from app.web.routes import router
 
@@ -46,6 +48,8 @@ def create_app(settings: Settings | None = None, *, _operational: bool = False) 
     app.state.settings = configured_settings
     app.state.operational_lock = None
     app.state.operational_ready = False
+    app.state.commercial_gate = CommercialActivationGate()
+    app.state.credential_store = KeyringCredentialStore()
     app.include_router(router)
     return app
 
