@@ -19,6 +19,8 @@ from app.integrations.ai_schema import (
     project_analysis_input, response_schema,
 )
 from app.security.credentials import CredentialStore
+from app.security.activation import CommercialActivationGate
+from app.security.single_instance import SingleInstanceLock
 
 
 _REQUEST_LOCK = threading.Lock()
@@ -131,12 +133,16 @@ class OpenAIAnalysis:
     """One provider call at a time; no secret or source text retained on the instance."""
 
     def __init__(self, settings: AISettings, credentials: CredentialStore, *,
+                 ownership: SingleInstanceLock | None = None,
+                 commercial_gate: CommercialActivationGate | None = None,
                  client_factory: Callable[..., object] | None = None,
                  clock: Callable[[], float] | None = None,
                  sleep: Callable[[float], None] | None = None,
                  wall_clock: Callable[[], float] | None = None):
         self._settings = settings
         self._credentials = credentials
+        self._ownership = ownership
+        self._commercial_gate = commercial_gate
         self._client_factory = client_factory
         self._clock = clock or time.monotonic
         self._sleep = sleep or time.sleep
@@ -145,10 +151,26 @@ class OpenAIAnalysis:
     def __repr__(self) -> str:
         return "OpenAIAnalysis()"
 
+    def _require_authorization(self) -> None:
+        try:
+            owned = self._ownership is not None and self._ownership.is_owner is True
+        except Exception:
+            owned = False
+        if not owned:
+            _raise("operational_ownership_required")
+        try:
+            authorized = (self._commercial_gate is not None and
+                          self._commercial_gate.is_enabled is True)
+        except Exception:
+            authorized = False
+        if not authorized:
+            _raise("commercial_activation_required")
+
     def analyze(self, analysis_input: AnalysisInput) -> AnalysisCandidates:
         settings = self._settings
         if not settings.enabled:
             _raise("disabled")
+        self._require_authorization()
         if (settings.provider != "openai" or settings.base_url not in _ALLOWED_BASE_URLS or
                 type(settings.timeout_seconds) is not int or settings.timeout_seconds != 60 or
                 type(settings.max_retries) is not int or settings.max_retries != 1 or
@@ -194,6 +216,7 @@ class OpenAIAnalysis:
                 remaining = deadline - self._clock()
                 if remaining <= _MIN_ATTEMPT_SECONDS:
                     _raise("timeout")
+                self._require_authorization()
                 try:
                     response = client.responses.create(
                         model=settings.model,

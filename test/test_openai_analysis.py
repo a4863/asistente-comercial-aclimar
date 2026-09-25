@@ -14,6 +14,18 @@ import pytest
 from app.config import AISettings
 from app.domain.email_analysis import AnalysisCandidates, AnalysisInput, SelectedMessage
 from app.integrations.openai_analysis import OpenAIAnalysis, OpenAIAnalysisError
+from app.security.activation import CommercialActivationGate
+
+
+class FakeOwnership:
+    def __init__(self, owned=True):
+        self.is_owner = owned
+
+
+def _enabled_gate():
+    gate = CommercialActivationGate()
+    gate.enable()
+    return gate
 
 
 class APIConnectionError(Exception):
@@ -112,6 +124,8 @@ class FakeFactory:
 
 
 def _adapter(*, settings=None, credentials=None, factory=None, **kwargs):
+    kwargs.setdefault("ownership", FakeOwnership())
+    kwargs.setdefault("commercial_gate", _enabled_gate())
     return OpenAIAnalysis(settings or AISettings(enabled=True,
                             base_url="https://eu.api.openai.com/v1"),
                           credentials or FakeCredentials(),
@@ -124,6 +138,70 @@ def test_disabled_does_not_touch_credentials_or_client():
     with pytest.raises(OpenAIAnalysisError, match="disabled"):
         adapter.analyze(_input())
     assert credentials.calls == factory.kwargs == factory.responses.calls == []
+
+
+@pytest.mark.parametrize("ownership, gate, code", [
+    (None, None, "operational_ownership_required"),
+    (FakeOwnership(False), None, "operational_ownership_required"),
+    (FakeOwnership(True), CommercialActivationGate(), "commercial_activation_required"),
+])
+def test_missing_ownership_or_commercial_authorization_blocks_before_credentials(
+        ownership, gate, code):
+    credentials, factory = FakeCredentials(), FakeFactory()
+    adapter = OpenAIAnalysis(AISettings(enabled=True), credentials,
+                             ownership=ownership, commercial_gate=gate,
+                             client_factory=factory)
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        adapter.analyze(_input())
+    assert caught.value.code == code
+    assert credentials.calls == factory.kwargs == factory.responses.calls == []
+
+
+def test_disabled_precedes_ownership_and_commercial_checks():
+    credentials, factory = FakeCredentials(), FakeFactory()
+    adapter = OpenAIAnalysis(AISettings(), credentials, client_factory=factory)
+    with pytest.raises(OpenAIAnalysisError, match="disabled"):
+        adapter.analyze(_input())
+    assert credentials.calls == factory.kwargs == factory.responses.calls == []
+
+
+@pytest.mark.parametrize("revoke", ["gate", "owner"])
+def test_revocation_during_retry_delay_prevents_second_attempt(revoke):
+    gate, owner = _enabled_gate(), FakeOwnership()
+    factory = FakeFactory([APIConnectionError("synthetic-secret-and-body"), _response()])
+
+    def sleep(_delay):
+        if revoke == "gate":
+            gate.disable()
+        else:
+            owner.is_owner = False
+
+    adapter = _adapter(factory=factory, commercial_gate=gate, ownership=owner, sleep=sleep)
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        adapter.analyze(_input())
+    assert caught.value.code == ("commercial_activation_required" if revoke == "gate"
+                                 else "operational_ownership_required")
+    assert len(factory.responses.calls) == 1
+    assert "synthetic-secret-and-body" not in str(caught.value)
+
+
+def test_revocation_after_client_creation_prevents_first_attempt():
+    gate, owner = _enabled_gate(), FakeOwnership()
+    factory = FakeFactory()
+
+    def revoke_during_factory(**kwargs):
+        result = factory(**kwargs)
+        gate.disable()
+        return result
+
+    adapter = OpenAIAnalysis(AISettings(enabled=True,
+                             base_url="https://eu.api.openai.com/v1"), FakeCredentials(),
+                             client_factory=revoke_during_factory, commercial_gate=gate,
+                             ownership=owner)
+    with pytest.raises(OpenAIAnalysisError, match="commercial_activation_required"):
+        adapter.analyze(_input())
+    assert len(factory.kwargs) == 1
+    assert factory.responses.calls == []
 
 
 @pytest.mark.parametrize("credentials, expected", [

@@ -20,6 +20,7 @@ from app.domain.email_analysis import (
     SupportRef, TaskCandidate, select_analysis_input,
 )
 from app.integrations.openai_analysis import OpenAIAnalysis
+from app.security.activation import CommercialActivationGate
 from app.persistence.database import make_session_factory
 from app.persistence.models import (
     ActionProposal, Alert, AnalysisDerivationLink, AnalysisOperationalLink, AnalysisRun,
@@ -140,9 +141,12 @@ class _OfflineOpenAI:
         return _remote_response(outcome)
 
     def adapter(self):
+        gate = CommercialActivationGate()
+        gate.enable()
         return OpenAIAnalysis(AISettings(enabled=True,
                               base_url="https://eu.api.openai.com/v1"),
-                              self, client_factory=self)
+                              self, client_factory=self,
+                              ownership=SimpleNamespace(is_owner=True), commercial_gate=gate)
 
 
 @pytest.fixture
