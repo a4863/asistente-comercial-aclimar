@@ -293,3 +293,18 @@ Approved:
 - Retry is not force reanalysis; `force_reanalysis` remains out of scope.
 - No new persistent request-id/idempotency table is introduced for 6E2.
 - The route/service must enforce the distinction server-side; UI labels alone are insufficient.
+
+
+## D18 — Phase 6F one-time live synthetic smoke authorization
+
+Approved by user on 2026-09-25:
+- Authorize exactly one live execution of the existing `asistente-aclimar-ai-smoke` command.
+- The call may transmit only the fixed non-commercial synthetic payload already hardcoded in `OpenAIAnalysis.smoke()`.
+- This authorization does not permit IMAP, CRM, Calendar, notes, SQLite commercial records, email bodies, or any real commercial source data to be sent.
+- Commercial activation gate must remain OFF before, during and after the smoke.
+- The smoke must use the configured OpenAI credential from Windows Credential Manager/keyring and the configured allowed endpoint/model.
+- Operational single-instance ownership is mandatory; if the assistant process already holds the lock, the smoke must fail closed rather than bypass it.
+- The execution is one-shot for this authorization. A retry after any live failure requires fresh explicit approval.
+- Success is only evidence that the configured credential/endpoint/model/Responses/strict-schema/decoder path works for the fixed synthetic payload.
+- Success does not establish EU residency, ZDR, retention guarantees, legal compliance, or authorization for commercial-data processing.
+- No code changes are authorized merely to make the smoke pass. Any implementation defect discovered by the live smoke returns to normal analyze/plan/implement/review workflow.
