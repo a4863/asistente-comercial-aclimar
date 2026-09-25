@@ -18,6 +18,29 @@ def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
 
 
+def test_get_routes_reject_foreign_host_without_exposing_status():
+    app = create_app(Settings())
+    app.state.credential_store = SimpleNamespace(
+        credential_presence=lambda *_args: pytest.fail("foreign Host reached status"))
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        assert client.get("/health").status_code == 200
+        for path in ("/health", "/"):
+            response = client.get(path, headers={"Host": "evil.example:8000"})
+            assert response.status_code == 400
+
+
+def test_status_does_not_expose_session_or_csrf_material():
+    app = create_app(Settings())
+    app.state.credential_store = SimpleNamespace(credential_presence=lambda *_args: "missing")
+    secret = app.user_middleware[0].kwargs["secret_key"]
+    with TestClient(app) as client:
+        response = client.get("/")
+        assert client.post("/").status_code == 405
+    assert response.status_code == 200
+    assert secret not in response.text
+    assert "csrf_token" not in response.text and "aclimar_session" not in response.text
+
+
 def test_status_page(client):
     client.app.state.credential_store = SimpleNamespace(
         credential_presence=lambda service, account: "missing")

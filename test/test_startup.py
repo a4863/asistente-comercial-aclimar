@@ -25,6 +25,16 @@ def _synthetic_settings(isolated_tmp_path):
     return database, settings
 
 
+def test_separate_app_compositions_get_distinct_runtime_session_secrets():
+    first = create_app(Settings())
+    second = create_app(Settings())
+    first_secret = first.user_middleware[0].kwargs["secret_key"]
+    second_secret = second.user_middleware[0].kwargs["secret_key"]
+    assert isinstance(first_secret, str) and len(first_secret) >= 32
+    assert first_secret != second_secret
+    assert first_secret not in repr(first) and first_secret not in repr(second)
+
+
 def _marker_and_runs(settings):
     factory = make_session_factory(settings.database_url)
     try:

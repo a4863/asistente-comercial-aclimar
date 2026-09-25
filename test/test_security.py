@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from fastapi import Request
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -20,7 +22,12 @@ from app.domain.email_analysis import (
     InferenceCandidate, QuestionCandidate, SelectedMessage, SupportRef,
 )
 from app.integrations.openai_analysis import OpenAIAnalysis
+from app.main import create_app
 from app.security.activation import CommercialActivationGate
+from app.security.session import (
+    issue_csrf_token, valid_local_host, valid_local_origin, validate_csrf_token,
+    validate_protected_request,
+)
 from app.persistence.database import make_session_factory
 from app.persistence.models import (
     ActionProposal, Alert, AnalysisRun, AnalysisSourceEvidence, ApprovalDecision,
@@ -515,3 +522,74 @@ def test_failed_provider_run_is_not_reused_by_next_attempt(secure_db):
         assert [item.run_version for item in runs] == [1, 2]
         assert [item.status for item in runs] == ["failed_retryable", "completed"]
     _assert_no_external_authority(secure_db)
+
+
+def _local_request(app, host="127.0.0.1:8000", origin="http://127.0.0.1:8000", session=None):
+    headers = [(b"host", host.encode("ascii"))]
+    if origin is not None:
+        headers.append((b"origin", origin.encode("ascii")))
+    return Request({"type": "http", "method": "POST", "scheme": "http", "path": "/future",
+                    "root_path": "", "query_string": b"", "headers": headers,
+                    "client": ("127.0.0.1", 12345), "server": ("127.0.0.1", 8000),
+                    "app": app, "session": session if session is not None else {}})
+
+
+def test_local_session_cookie_is_signed_and_never_contains_app_secret(monkeypatch):
+    secret = "synthetic-session-secret-never-in-cookie"
+    monkeypatch.setattr("app.main.secrets.token_urlsafe", lambda _size: secret)
+    app = create_app()
+
+    @app.get("/_test_session")
+    def test_only_session(request: Request):
+        request.session["test"] = "local"
+        return {"session": request.session["test"]}
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        response = client.get("/_test_session")
+    cookie = response.headers["set-cookie"]
+    assert response.json() == {"session": "local"}
+    assert cookie.startswith("aclimar_session=")
+    assert "httponly" in cookie.lower() and "samesite=strict" in cookie.lower()
+    assert "domain=" not in cookie.lower() and "max-age=1800" in cookie.lower()
+    assert secret not in cookie and secret not in repr(app)
+
+
+@pytest.mark.parametrize("host", [
+    "evil.example:8000", "127.0.0.1.evil:8000", "127.0.0.1@evil.example:8000",
+    "127.0.0.1:abc", "127.0.0.1:8001", "127.0.0.1:08000", "[::1]:8000",
+])
+def test_local_host_rejects_foreign_or_malformed_values(host):
+    assert not valid_local_host(_local_request(create_app(), host=host))
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1:8000", "localhost:8000"])
+def test_local_host_accepts_approved_loopback(host):
+    assert valid_local_host(_local_request(create_app(), host=host))
+
+
+@pytest.mark.parametrize("origin", [
+    None, "null", "https://127.0.0.1:8000", "http://127.0.0.1:8001",
+    "http://localhost:8000", "http://evil.example:8000", "http://127.0.0.1:8000/path",
+    "http://user@127.0.0.1:8000", "http://127.0.0.1:bad",
+])
+def test_protected_request_rejects_missing_or_foreign_origin(origin):
+    app = create_app()
+    session = {}
+    token = issue_csrf_token(session)
+    request = _local_request(app, origin=origin, session=session)
+    assert not valid_local_origin(request)
+    assert not validate_protected_request(request, token)
+
+
+def test_protected_request_requires_session_csrf_and_same_origin():
+    app = create_app()
+    session = {}
+    token = issue_csrf_token(session)
+    request = _local_request(app, session=session)
+    assert valid_local_origin(request)
+    assert validate_protected_request(request, token)
+    assert not validate_protected_request(request, None)
+    assert not validate_protected_request(request, "wrong")
+    assert not validate_protected_request(_local_request(app), token)
+    assert not validate_csrf_token({"csrf_token": 42}, token)
+    assert not validate_csrf_token(session, 42)

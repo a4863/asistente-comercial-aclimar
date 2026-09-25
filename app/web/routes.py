@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 
-router = APIRouter()
+from app.security.session import require_local_host
+
+router = APIRouter(dependencies=[Depends(require_local_host)])
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 @router.get("/health")

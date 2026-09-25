@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import secrets
 
 from fastapi import FastAPI
 import uvicorn
@@ -9,6 +10,7 @@ from app.persistence.repositories import AnalysisRepository
 from app.security.activation import CommercialActivationGate
 from app.security.credentials import KeyringCredentialStore
 from app.security.single_instance import SingleInstanceLock
+from app.security.session import LocalSessionMiddleware
 from app.web.routes import router
 
 
@@ -45,6 +47,7 @@ def create_app(settings: Settings | None = None, *, _operational: bool = False) 
         raise ValueError("The application must bind only to 127.0.0.1")
     app = FastAPI(title="Asistente Comercial ACLIMAR",
                   lifespan=_operational_lifespan if _operational else None)
+    app.add_middleware(LocalSessionMiddleware, secret_key=secrets.token_urlsafe(32))
     app.state.settings = configured_settings
     app.state.operational_lock = None
     app.state.operational_ready = False
