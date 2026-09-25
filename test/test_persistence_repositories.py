@@ -17,6 +17,7 @@ from app.persistence.models import (
     ApprovalDecision,
     AuditEvent,
     Commitment,
+    ConfigurationReference,
     Conversation,
     ConversationMembership,
     ExecutionResult,
@@ -1084,6 +1085,101 @@ def _reserve_analysis(repo, source, conversation, *, digest="a" * 64,
                       scope="imap:one"):
     return repo.reserve_run(scope, source.id, conversation.id, digest,
                             contract_version, policy_version, mode)
+
+
+def _cutover_marker(db_session):
+    return db_session.scalar(select(ConfigurationReference).where(
+        ConfigurationReference.scope == "phase6_lock_cutover"))
+
+
+def test_analysis_cutover_clean_creation_and_idempotent_reentry(db_session):
+    repo = AnalysisRepository(db_session)
+    assert repo.establish_cutover_or_recover() == ("created", 0)
+    marker = _cutover_marker(db_session)
+    assert (marker.reference_kind, marker.reference_value) == ("operational_ownership", "v1")
+    db_session.commit()
+    assert repo.establish_cutover_or_recover() == ("recovered", 0)
+    assert _cutover_marker(db_session).id == marker.id
+    assert db_session.scalar(select(ConfigurationReference).where(
+        ConfigurationReference.scope == "phase6_lock_cutover")).id == marker.id
+
+
+def test_analysis_cutover_refuses_legacy_reserved_without_mutation(db_session):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+    run = _reserve_analysis(repo, source, conversation).run
+    run_id = run.id
+    db_session.commit()
+
+    with pytest.raises(AnalysisRepositoryError, match="cutover_requires_operator"):
+        repo.establish_cutover_or_recover()
+    db_session.rollback()
+    assert _cutover_marker(db_session) is None
+    assert (db_session.get(AnalysisRun, run_id).status,
+            db_session.get(AnalysisRun, run_id).failure_code) == ("reserved", None)
+
+
+def test_analysis_cutover_recovers_only_reserved_and_replays_without_change(db_session):
+    repo = AnalysisRepository(db_session)
+    assert repo.establish_cutover_or_recover() == ("created", 0)
+    db_session.commit()
+    source, conversation = _analysis_target(db_session)
+    runs = [_reserve_analysis(repo, source, conversation, digest=letter * 64).run
+            for letter in "abcd"]
+    repo.finalize_run_status(runs[1].id)
+    repo.mark_retryable(runs[2].id, status="stale_retryable", failure_code="input_changed")
+    repo.mark_retryable(runs[3].id, status="failed_retryable", failure_code="provider_failure")
+    ids = [run.id for run in runs]
+    db_session.commit()
+    db_session.expire_all()
+    before = {run_id: (db_session.get(AnalysisRun, run_id).status,
+                       db_session.get(AnalysisRun, run_id).failure_code,
+                       db_session.get(AnalysisRun, run_id).updated_at)
+              for run_id in ids}
+    assert repo.establish_cutover_or_recover() == ("recovered", 1)
+    db_session.commit()
+    db_session.expire_all()
+    recovered = db_session.get(AnalysisRun, ids[0])
+    assert (recovered.status, recovered.failure_code) == ("failed_retryable", "interrupted")
+    assert {run_id: (db_session.get(AnalysisRun, run_id).status,
+                     db_session.get(AnalysisRun, run_id).failure_code,
+                     db_session.get(AnalysisRun, run_id).updated_at)
+            for run_id in ids[1:]} == {run_id: before[run_id] for run_id in ids[1:]}
+    timestamp = recovered.updated_at
+    assert repo.establish_cutover_or_recover() == ("recovered", 0)
+    db_session.commit()
+    db_session.expire_all()
+    assert db_session.get(AnalysisRun, ids[0]).updated_at == timestamp
+
+
+@pytest.mark.parametrize("kind,value", [("wrong", "v1"), ("operational_ownership", "wrong")])
+def test_analysis_cutover_rejects_malformed_marker(db_session, kind, value):
+    db_session.add(ConfigurationReference(scope="phase6_lock_cutover",
+                                          reference_kind=kind, reference_value=value))
+    db_session.commit()
+    with pytest.raises(AnalysisRepositoryError, match="invalid_cutover_marker"):
+        AnalysisRepository(db_session).establish_cutover_or_recover()
+
+
+def test_analysis_cutover_marker_creation_is_caller_transactional(db_session):
+    repo = AnalysisRepository(db_session)
+    assert repo.establish_cutover_or_recover() == ("created", 0)
+    db_session.rollback()
+    assert _cutover_marker(db_session) is None
+
+
+def test_analysis_cutover_recovery_is_caller_transactional(db_session):
+    repo = AnalysisRepository(db_session)
+    assert repo.establish_cutover_or_recover() == ("created", 0)
+    db_session.commit()
+    source, conversation = _analysis_target(db_session)
+    run_id = _reserve_analysis(repo, source, conversation).run.id
+    db_session.commit()
+    assert repo.establish_cutover_or_recover() == ("recovered", 1)
+    db_session.rollback()
+    db_session.expire_all()
+    assert (db_session.get(AnalysisRun, run_id).status,
+            db_session.get(AnalysisRun, run_id).failure_code) == ("reserved", None)
 
 
 def test_analysis_reservation_in_progress_and_changed_input_versions(db_session):

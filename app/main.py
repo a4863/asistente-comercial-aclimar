@@ -4,6 +4,8 @@ from fastapi import FastAPI
 import uvicorn
 
 from app.config import Settings, load_settings
+from app.persistence.database import make_session_factory
+from app.persistence.repositories import AnalysisRepository
 from app.security.single_instance import SingleInstanceLock
 from app.web.routes import router
 
@@ -13,9 +15,24 @@ async def _operational_lifespan(app: FastAPI):
     lock = SingleInstanceLock(app.state.settings.database_url)
     lock.acquire()
     try:
+        if not lock.is_owner:
+            raise RuntimeError("operational_lock_unavailable")
         app.state.operational_lock = lock
+        try:
+            factory = make_session_factory(app.state.settings.database_url)
+            try:
+                with factory.begin() as session:
+                    AnalysisRepository(session).establish_cutover_or_recover()
+            finally:
+                factory.kw["bind"].dispose()
+        except Exception:
+            raise RuntimeError("startup_recovery_failed") from None
+        if not lock.is_owner:
+            raise RuntimeError("operational_lock_unavailable")
+        app.state.operational_ready = True
         yield
     finally:
+        app.state.operational_ready = False
         app.state.operational_lock = None
         lock.close()
 
@@ -28,6 +45,7 @@ def create_app(settings: Settings | None = None, *, _operational: bool = False) 
                   lifespan=_operational_lifespan if _operational else None)
     app.state.settings = configured_settings
     app.state.operational_lock = None
+    app.state.operational_ready = False
     app.include_router(router)
     return app
 

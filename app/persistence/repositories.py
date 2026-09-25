@@ -21,6 +21,7 @@ from app.persistence.models import (
     ApprovalDecision,
     AuditEvent,
     Commitment,
+    ConfigurationReference,
     CRMContextLink,
     CRMReference,
     Conversation,
@@ -166,9 +167,41 @@ class AnalysisRepository:
     _DIGEST = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
     _MODES = frozenset({"automatic", "manual", "force"})
     _FAILED_CODES = frozenset({"provider_failure", "invalid_output", "persistence_failure", "interrupted"})
+    _CUTOVER_SCOPE = "phase6_lock_cutover"
+    _CUTOVER_KIND = "operational_ownership"
+    _CUTOVER_VALUE = "v1"
 
     def __init__(self, session: Session):
         self.session = session
+
+    def establish_cutover_or_recover(self) -> tuple[str, int]:
+        """Cut over only with zero reservations; later recover under the caller's lock/transaction."""
+        with self.session.no_autoflush:
+            marker = self.session.scalar(select(ConfigurationReference).where(
+                ConfigurationReference.scope == self._CUTOVER_SCOPE))
+            if marker is None:
+                reserved_id = self.session.scalar(select(AnalysisRun.id).where(
+                    AnalysisRun.status == "reserved").limit(1))
+                if reserved_id is not None:
+                    raise AnalysisRepositoryError("cutover_requires_operator")
+                self.session.add(ConfigurationReference(
+                    scope=self._CUTOVER_SCOPE, reference_kind=self._CUTOVER_KIND,
+                    reference_value=self._CUTOVER_VALUE))
+                try:
+                    self.session.flush()
+                except IntegrityError:
+                    raise AnalysisRepositoryError("cutover_conflict") from None
+                return "created", 0
+            if (marker.reference_kind != self._CUTOVER_KIND or
+                    marker.reference_value != self._CUTOVER_VALUE):
+                raise AnalysisRepositoryError("invalid_cutover_marker")
+            result = self.session.execute(update(AnalysisRun).where(
+                AnalysisRun.status == "reserved").values(
+                status="failed_retryable", failure_code="interrupted",
+                updated_at=datetime.now(timezone.utc)))
+            if result.rowcount is None or result.rowcount < 0:
+                raise AnalysisRepositoryError("cutover_recovery_unverified")
+            return "recovered", result.rowcount
 
     @staticmethod
     def _id(value: int) -> None:
