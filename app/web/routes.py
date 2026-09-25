@@ -63,7 +63,7 @@ async def _target_id(request: Request) -> int | None:
     if not isinstance(data, dict) or set(data) != {"source_record_id"}:
         return None
     source_id = data["source_record_id"]
-    return source_id if type(source_id) is int and source_id > 0 else None
+    return source_id if type(source_id) is int and 0 < source_id <= 2**63 - 1 else None
 
 
 async def _manual_analysis(request: Request, intent: str) -> JSONResponse:

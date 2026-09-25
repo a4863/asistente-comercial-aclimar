@@ -1,7 +1,11 @@
 import logging
+import hashlib
+import hmac
 import re
 import socket
 import sys
+import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -14,10 +18,12 @@ from app.config import AISettings, IMAPSettings, Settings
 from app.main import create_app
 from app.persistence.database import make_session_factory
 from app.persistence.models import (
-    AnalysisRun, Base, Conversation, ConversationMembership, EmailMessage, SourceRecord,
+    ActionProposal, AnalysisRun, AnalysisSourceEvidence, ApprovalDecision, Base, Conversation,
+    ConversationMembership, EmailMessage, ExecutionResult, SourceRecord,
 )
 from app.security.session import issue_csrf_token, validate_csrf_token
 from app.services.email_analysis import FakeAIService
+from app.domain.email_analysis import AnalysisCandidates
 
 
 def test_health(client):
@@ -426,3 +432,226 @@ def test_manual_post_rejects_duplicate_json_key(manual_web):
                                content=b'{"source_record_id":1,"source_record_id":1}',
                                headers=headers | {"Content-Type": "application/json"})
         assert response.json() == {"status": "invalid_request"}
+
+
+def test_manual_post_rejects_out_of_range_integer_before_database(manual_web):
+    app, _, _, _ = manual_web
+    app.state.commercial_gate = SimpleNamespace(is_enabled=True)
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        headers = _action_headers(client.get("/"))
+        response = client.post("/analysis/email", content=b'{"source_record_id":' +
+                               b'9' * 100 + b'}',
+                               headers=headers | {"Content-Type": "application/json"})
+        assert response.status_code == 400 and response.json() == {"status": "invalid_request"}
+
+
+@pytest.mark.parametrize("host", [
+    "127.0.0.1.evil:8000", "127.0.0.1@evil.example:8000", "127.0.0.1:bad",
+])
+def test_manual_post_rejects_misleading_host(manual_web, host):
+    app, _, source_id, _ = manual_web
+    app.state.commercial_gate = SimpleNamespace(is_enabled=True)
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        headers = _action_headers(client.get("/")) | {"Host": host}
+        assert client.post("/analysis/email", json={"source_record_id": source_id},
+                           headers=headers).status_code == 400
+
+
+def test_manual_post_requires_origin_even_with_same_origin_referer(manual_web):
+    app, factory, source_id, presence_calls = manual_web
+    app.state.commercial_gate = SimpleNamespace(is_enabled=True)
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        headers = _action_headers(client.get("/"))
+        headers.pop("Origin")
+        headers["Referer"] = "http://127.0.0.1:8000/"
+        presence_calls.clear()
+        response = client.post("/analysis/email", json={"source_record_id": source_id},
+                               headers=headers)
+        assert response.json() == {"status": "invalid_security"}
+        assert presence_calls == []
+    with factory() as session:
+        assert session.scalars(select(AnalysisRun)).all() == []
+
+
+def test_tampered_expired_and_other_app_session_cannot_authorize(manual_web):
+    app, factory, source_id, _ = manual_web
+    app.state.commercial_gate = SimpleNamespace(is_enabled=True)
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        headers = _action_headers(client.get("/"))
+        cookie = client.cookies.get("aclimar_session")
+        assert cookie
+        client.cookies.set("aclimar_session", cookie[:-1] + ("0" if cookie[-1] != "0" else "1"))
+        assert client.post("/analysis/email", json={"source_record_id": source_id},
+                           headers=headers).json() == {"status": "invalid_security"}
+
+        payload = cookie.split(".")[0]
+        old_time = str(int(time.time()) - 3600)
+        secret = app.user_middleware[0].kwargs["secret_key"].encode()
+        signature = hmac.new(secret, f"{payload}.{old_time}".encode(), hashlib.sha256).hexdigest()
+        client.cookies.set("aclimar_session", f"{payload}.{old_time}.{signature}")
+        assert client.post("/analysis/email", json={"source_record_id": source_id},
+                           headers=headers).json() == {"status": "invalid_security"}
+
+    other = create_app(app.state.settings)
+    other.state.operational_ready = True
+    other.state.operational_lock = SimpleNamespace(is_owner=True)
+    other.state.commercial_gate = SimpleNamespace(is_enabled=True)
+    other.state.credential_store = SimpleNamespace(credential_presence=lambda *_args: "present")
+    with TestClient(other, base_url="http://127.0.0.1:8000") as client:
+        client.cookies.set("aclimar_session", cookie)
+        assert client.post("/analysis/email", json={"source_record_id": source_id},
+                           headers=headers).json() == {"status": "invalid_security"}
+    with factory() as session:
+        assert session.scalars(select(AnalysisRun)).all() == []
+
+
+@pytest.mark.parametrize("body,content_type", [
+    (b'{"source_record_id":-1}', "application/json"),
+    (b'{"source_record_id":0}', "application/json"),
+    (b'{"source_record_id":true}', "application/json"),
+    (b'{"source_record_id":{}}', "application/json"),
+    (b'{"source_record_id":1,"account_scope":"imap:foreign"}', "application/json"),
+    (b'{"source_record_id":1,"provider":"evil"}', "application/json"),
+    (b'{"source_record_id":1,"request_mode":"force"}', "application/json"),
+    (b'{"source_record_id":1,"credential_ref":"evil"}', "application/json"),
+    (b'{"source_record_id":1,"body":"private"}', "application/json"),
+    (b'{"source_record_id":1,"force":true}', "application/json"),
+    (b'{"source_record_id":1', "application/json"),
+    (b'\xff', "application/json"),
+    (b'{"source_record_id":1}', "text/plain"),
+])
+def test_manual_post_rejects_untrusted_body_fields_and_encoding(
+        manual_web, body, content_type):
+    app, factory, _, _ = manual_web
+    app.state.commercial_gate = SimpleNamespace(is_enabled=True)
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        headers = _action_headers(client.get("/")) | {"Content-Type": content_type}
+        response = client.post("/analysis/email", content=body, headers=headers)
+        assert response.status_code == 400 and response.json() == {"status": "invalid_request"}
+    with factory() as session:
+        assert session.scalars(select(AnalysisRun)).all() == []
+
+
+@pytest.mark.parametrize("change", [
+    "unknown", "wrong_account", "deleted", "redacted", "unresolved", "superseded",
+])
+def test_manual_post_revalidates_target_after_selector(manual_web, monkeypatch, change):
+    app, factory, source_id, _ = manual_web
+    app.state.commercial_gate = SimpleNamespace(is_enabled=True)
+    fake = FakeAIService()
+    monkeypatch.setattr("app.web.routes.OpenAIAnalysis", lambda *_args, **_kwargs: fake)
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        headers = _action_headers(client.get("/"))
+        target_id = source_id
+        if change == "unknown":
+            target_id = source_id + 10_000
+        else:
+            with factory() as session, session.begin():
+                source = session.get(SourceRecord, source_id)
+                conversation_id = session.scalar(select(ConversationMembership.conversation_id).where(
+                    ConversationMembership.source_record_id == source_id))
+                conversation = session.get(Conversation, conversation_id)
+                if change == "wrong_account":
+                    source.source_system_scope = "imap:other"
+                elif change in {"deleted", "redacted"}:
+                    source.retention_state = "deleted_at_source" if change == "deleted" else "redacted"
+                    source.deleted_or_redacted_at = datetime.now(timezone.utc)
+                elif change == "unresolved":
+                    conversation.legacy_status = "legacy_unresolved"
+                    conversation.account_scope = None
+                else:
+                    conversation.superseded_at = datetime.now(timezone.utc)
+        response = client.post("/analysis/email", json={"source_record_id": target_id},
+                               headers=headers)
+        assert response.status_code == 404 and response.json() == {"status": "invalid_target"}
+        assert fake.calls == []
+        assert "PRIVATE BODY" not in response.text and "imap:web" not in response.text
+        if change != "unknown":
+            assert f'data-source-id="{source_id}"' not in client.get("/").text
+    with factory() as session:
+        assert session.scalars(select(AnalysisRun)).all() == []
+
+
+def test_selector_escapes_and_truncates_untrusted_metadata(manual_web):
+    app, factory, source_id, _ = manual_web
+    with factory() as session, session.begin():
+        email = session.scalar(select(EmailMessage).where(
+            EmailMessage.source_record_id == source_id))
+        email.sender_address = "<script>" + "s" * 200
+        email.subject = "subject\r\n" + "x" * 200
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        page = client.get("/")
+        assert "<script>ssss" not in page.text
+        assert "&lt;script&gt;" in page.text
+        assert "subject  " in page.text and "subject\r\n" not in page.text
+        assert "s" * 200 not in page.text and "x" * 200 not in page.text
+        assert "PRIVATE BODY" not in page.text
+
+
+def test_gate_revoked_between_route_preflight_and_adapter_stops_secret_lookup(
+        manual_web):
+    app, factory, source_id, _ = manual_web
+
+    class RevokedGate:
+        reads = 0
+
+        @property
+        def is_enabled(self):
+            self.reads += 1
+            return self.reads == 1
+
+    app.state.commercial_gate = RevokedGate()
+    secret_reads = []
+    app.state.credential_store = SimpleNamespace(
+        credential_presence=lambda *_args: "present",
+        get_secret=lambda *_args: secret_reads.append("secret") or "synthetic-key")
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        page = client.get("/")
+        app.state.commercial_gate.reads = 0
+        headers = _action_headers(page)
+        response = client.post("/analysis/email", json={"source_record_id": source_id},
+                               headers=headers)
+        assert response.json() == {"status": "failed_retryable"}
+        assert secret_reads == []
+    with factory() as session:
+        runs = session.scalars(select(AnalysisRun)).all()
+        assert len(runs) == 1 and runs[0].failure_code == "provider_failure"
+        for model in (ActionProposal, ApprovalDecision, ExecutionResult):
+            assert session.scalars(select(model)).all() == []
+
+
+def test_manual_post_changed_after_provider_is_stale_without_derived_writes(
+        manual_web, monkeypatch):
+    app, factory, source_id, _ = manual_web
+    app.state.commercial_gate = SimpleNamespace(is_enabled=True)
+
+    class ChangingFake:
+        def analyze(self, _analysis_input):
+            with factory() as session, session.begin():
+                email = session.scalar(select(EmailMessage).where(
+                    EmailMessage.source_record_id == source_id))
+                email.normalized_body = "Changed while provider was working"
+            return AnalysisCandidates()
+
+    monkeypatch.setattr("app.web.routes.OpenAIAnalysis", lambda *_args, **_kwargs: ChangingFake())
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        headers = _action_headers(client.get("/"))
+        response = client.post("/analysis/email", json={"source_record_id": source_id},
+                               headers=headers)
+        assert response.json() == {"status": "stale_retryable"}
+        assert "Changed while provider" not in response.text
+    with factory() as session:
+        runs = session.scalars(select(AnalysisRun)).all()
+        assert len(runs) == 1 and runs[0].status == "stale_retryable"
+        for model in (AnalysisSourceEvidence, ActionProposal, ApprovalDecision, ExecutionResult):
+            assert session.scalars(select(model)).all() == []
+
+
+def test_no_browser_route_changes_commercial_gate(manual_web):
+    app, _, _, _ = manual_web
+    from app.web.routes import router
+
+    methods_by_path = {route.path: getattr(route, "methods", set()) for route in router.routes}
+    assert methods_by_path["/analysis/email"] == {"POST"}
+    assert methods_by_path["/analysis/email/retry"] == {"POST"}
+    assert all("gate" not in path and "activate" not in path for path in methods_by_path)

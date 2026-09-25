@@ -361,6 +361,40 @@ def test_competing_manual_retry_sees_reserved_run_without_second_provider(analys
     assert [run.run_version for run in _runs(analysis_db)] == [1, 2]
 
 
+def test_competing_manual_initial_sees_reserved_run_without_second_provider(analysis_db):
+    target_id, _, _ = _seed(analysis_db)
+
+    class CompetingProvider:
+        calls = 0
+
+        def analyze(self, _analysis_input):
+            self.calls += 1
+            competitor = FakeAIService()
+            result = analyze_email_in_thread(analysis_db, competitor, "imap:test", target_id,
+                                             request_mode="manual", manual_intent="initial")
+            assert result.status == "in_progress" and competitor.calls == []
+            return AnalysisCandidates()
+
+    provider = CompetingProvider()
+    result = analyze_email_in_thread(analysis_db, provider, "imap:test", target_id,
+                                     request_mode="manual", manual_intent="initial")
+    assert result.status == "completed" and provider.calls == 1
+    assert len(_runs(analysis_db)) == 1
+
+
+def test_failed_manual_retry_needs_another_explicit_retry(analysis_db):
+    target_id, _, _ = _seed(analysis_db)
+    fake = FakeAIService(fail=True)
+    for intent, expected in (("initial", "failed_retryable"),
+                             ("retry", "failed_retryable"),
+                             ("initial", "retry_required")):
+        result = analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                         request_mode="manual", manual_intent=intent)
+        assert result.status == expected
+    assert len(fake.calls) == 2
+    assert [run.run_version for run in _runs(analysis_db)] == [1, 2]
+
+
 def test_target_without_body_never_reserves_or_calls_provider(analysis_db):
     target_id, _, _ = _seed(analysis_db, body=None)
     fake = FakeAIService()
