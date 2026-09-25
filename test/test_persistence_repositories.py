@@ -1374,6 +1374,79 @@ def test_analysis_reservation_integrity_error_is_bounded(db_session, monkeypatch
     assert "private SQL detail" not in str(error.value)
 
 
+def test_manual_selector_is_bounded_scoped_ordered_and_metadata_only(db_session):
+    repo = AnalysisRepository(db_session)
+    for index in range(24):
+        source, _ = _analysis_target(db_session)
+        email = db_session.scalar(select(EmailMessage).where(
+            EmailMessage.source_record_id == source.id))
+        email.sender_address = f"sender{index}@example.test"
+        email.subject = f"Subject {index}"
+        email.normalized_body = f"PRIVATE BODY {index}"
+        email.sent_at = datetime(2026, 1, index + 1, tzinfo=timezone.utc)
+    hidden, _ = _analysis_target(db_session, scope="imap:two")
+    redacted, _ = _analysis_target(db_session)
+    redacted.retention_state = "redacted"
+    no_body, _ = _analysis_target(db_session)
+    db_session.scalar(select(EmailMessage).where(
+        EmailMessage.source_record_id == no_body.id)).normalized_body = None
+    db_session.flush()
+    refs = repo.list_eligible_email_refs("imap:one")
+    assert len(refs) == 20
+    assert [ref.subject for ref in refs] == [f"Subject {index}" for index in range(23, 3, -1)]
+    assert all(ref.account_scope == "imap:one" for ref in refs)
+    assert all(not hasattr(ref, "normalized_body") for ref in refs)
+    assert hidden.id not in {ref.source_record_id for ref in refs}
+    assert redacted.id not in {ref.source_record_id for ref in refs}
+    assert no_body.id not in {ref.source_record_id for ref in refs}
+    for invalid in (0, 21, True):
+        with pytest.raises(AnalysisRepositoryError):
+            repo.list_eligible_email_refs("imap:one", limit=invalid)
+
+
+def test_manual_intent_reservation_requires_explicit_retry_without_new_identity(db_session):
+    source, conversation = _analysis_target(db_session)
+    repo = AnalysisRepository(db_session)
+
+    def reserve(intent, digest="a" * 64):
+        return repo.reserve_manual_run("imap:one", source.id, conversation.id,
+                                       digest, 1, 1, intent=intent)
+
+    assert reserve("retry").outcome == "retry_not_available"
+    assert repo.latest_run_for_target("imap:one", source.id) is None
+    first = reserve("initial")
+    assert first.outcome == "reserved_new" and first.run.request_mode == "manual"
+    assert reserve("initial").outcome == "in_progress"
+    assert reserve("retry").outcome == "in_progress"
+    repo.mark_retryable(first.run.id, status="failed_retryable", failure_code="provider_failure")
+    assert reserve("initial").outcome == "retry_required"
+    assert len(repo.run_history("imap:one", source.id)) == 1
+    second = reserve("retry")
+    assert second.outcome == "reserved_new" and second.run.run_version == 2
+    repo.finalize_run_status(second.run.id)
+    assert reserve("initial").outcome == "completed_replay"
+    assert reserve("retry").outcome == "completed_replay"
+    assert reserve("retry", digest="b" * 64).outcome == "retry_not_available"
+    assert reserve("initial", digest="b" * 64).outcome == "reserved_new"
+    with pytest.raises(AnalysisRepositoryError):
+        reserve("force")
+
+
+def test_manual_retry_reservation_rollback_is_caller_owned(db_session):
+    source, conversation = _analysis_target(db_session)
+    db_session.commit()
+    repo = AnalysisRepository(db_session)
+    first = repo.reserve_manual_run("imap:one", source.id, conversation.id,
+                                    "a" * 64, 1, 1, intent="initial")
+    db_session.commit()
+    repo.mark_retryable(first.run.id, status="stale_retryable", failure_code="input_changed")
+    db_session.commit()
+    assert repo.reserve_manual_run("imap:one", source.id, conversation.id,
+                                   "a" * 64, 1, 1, intent="retry").outcome == "reserved_new"
+    db_session.rollback()
+    assert [run.run_version for run in repo.run_history("imap:one", source.id)] == [1]
+
+
 def test_analysis_run_repository_does_not_create_derivations(db_session):
     source, conversation = _analysis_target(db_session)
     repo = AnalysisRepository(db_session)

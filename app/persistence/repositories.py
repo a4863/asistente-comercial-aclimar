@@ -4,7 +4,7 @@ from hashlib import sha256
 import re
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -149,8 +149,17 @@ class AnalysisRepositoryError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class AnalysisReservation:
-    outcome: str  # reserved_new | completed_replay | in_progress
-    run: AnalysisRun
+    outcome: str  # reserved_new | completed_replay | in_progress | retry_required | retry_not_available
+    run: AnalysisRun | None
+
+
+@dataclass(frozen=True, slots=True)
+class SelectableEmailRef:
+    source_record_id: int
+    account_scope: str
+    sender: str | None
+    subject: str | None
+    message_date: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +182,33 @@ class AnalysisRepository:
 
     def __init__(self, session: Session):
         self.session = session
+
+    def list_eligible_email_refs(self, account_scope: str, *,
+                                 limit: int = 20) -> tuple[SelectableEmailRef, ...]:
+        self._scope(account_scope)
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise AnalysisRepositoryError("invalid_limit")
+        message_date = func.coalesce(EmailMessage.sent_at, EmailMessage.received_at,
+                                     SourceRecord.source_timestamp, SourceRecord.ingested_at)
+        with self.session.no_autoflush:
+            rows = self.session.execute(
+                select(SourceRecord.id, SourceRecord.source_system_scope,
+                       EmailMessage.sender_address, EmailMessage.subject, message_date)
+                .join(EmailMessage, EmailMessage.source_record_id == SourceRecord.id)
+                .join(ConversationMembership,
+                      ConversationMembership.source_record_id == SourceRecord.id)
+                .join(Conversation, Conversation.id == ConversationMembership.conversation_id)
+                .where(SourceRecord.source_type == "email_message",
+                       SourceRecord.source_system_scope == account_scope,
+                       SourceRecord.retention_state == "active",
+                       SourceRecord.deleted_or_redacted_at.is_(None),
+                       EmailMessage.normalized_body.is_not(None),
+                       Conversation.account_scope == account_scope,
+                       Conversation.legacy_status == "resolved",
+                       Conversation.superseded_at.is_(None))
+                .order_by(message_date.desc(), SourceRecord.id.desc()).limit(limit)
+            ).all()
+        return tuple(SelectableEmailRef(*row) for row in rows)
 
     def establish_cutover_or_recover(self) -> tuple[str, int]:
         """Cut over only with zero reservations; later recover under the caller's lock/transaction."""
@@ -247,6 +283,50 @@ class AnalysisRepository:
                     AnalysisRun.status == "completed",
                 ).order_by(AnalysisRun.run_version.desc()).limit(1)
             )
+
+    def latest_run_for_target(self, account_scope: str,
+                              target_source_record_id: int) -> AnalysisRun | None:
+        self._scope(account_scope)
+        self._id(target_source_record_id)
+        with self.session.no_autoflush:
+            return self.session.scalar(select(AnalysisRun).where(
+                AnalysisRun.account_scope == account_scope,
+                AnalysisRun.target_source_record_id == target_source_record_id,
+            ).order_by(AnalysisRun.run_version.desc()).limit(1))
+
+    def reserve_manual_run(self, account_scope: str, target_source_record_id: int,
+                           conversation_id: int, input_digest: str, contract_version: int,
+                           policy_version: int, *, intent: str) -> AnalysisReservation:
+        if intent not in {"initial", "retry"}:
+            raise AnalysisRepositoryError("invalid_manual_intent")
+        self._validate_input(input_digest, contract_version, policy_version)
+        self._target(account_scope, target_source_record_id, conversation_id)
+        with self.session.no_autoflush:
+            reserved = self.session.scalar(select(AnalysisRun).where(
+                AnalysisRun.account_scope == account_scope,
+                AnalysisRun.target_source_record_id == target_source_record_id,
+                AnalysisRun.input_digest == input_digest,
+                AnalysisRun.contract_version == contract_version,
+                AnalysisRun.policy_version == policy_version,
+                AnalysisRun.status == "reserved",
+            ).order_by(AnalysisRun.run_version.desc()).limit(1))
+            if reserved is not None:
+                return AnalysisReservation("in_progress", reserved)
+            replay = self.replay_lookup(account_scope, target_source_record_id,
+                                        input_digest, contract_version, policy_version)
+            if replay is not None:
+                return AnalysisReservation("completed_replay", replay)
+            latest = self.latest_run_for_target(account_scope, target_source_record_id)
+            retryable = (latest is not None and latest.status in {
+                "failed_retryable", "stale_retryable"} and
+                (latest.input_digest, latest.contract_version, latest.policy_version) ==
+                (input_digest, contract_version, policy_version))
+            if retryable and intent == "initial":
+                return AnalysisReservation("retry_required", latest)
+            if not retryable and intent == "retry":
+                return AnalysisReservation("retry_not_available", latest)
+            return self.reserve_run(account_scope, target_source_record_id, conversation_id,
+                                    input_digest, contract_version, policy_version, "manual")
 
     def replay_lookup(self, account_scope: str, target_source_record_id: int,
                       input_digest: str, contract_version: int,

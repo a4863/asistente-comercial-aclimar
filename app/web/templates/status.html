@@ -12,3 +12,52 @@
   <dt>Operational</dt><dd>{{ operational }}</dd>
   <dt>Synthetic smoke</dt><dd>{{ smoke }}</dd>
 </dl>
+{% if options %}
+<h2>Existing emails</h2>
+<ul>
+{% for option in options %}
+  <li>
+    <span>{{ option.sender }} — {{ option.subject }} — {{ option.message_date }} — {{ option.state }}</span>
+    {% if action_token and option.state == "ready" %}
+    <button type="button" class="analysis-action" data-source-id="{{ option.source_record_id }}" data-path="/analysis/email">Analyze</button>
+    {% elif action_token and option.state == "retry_required" %}
+    <button type="button" class="analysis-action" data-source-id="{{ option.source_record_id }}" data-path="/analysis/email/retry">Retry analysis</button>
+    {% endif %}
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+{% if action_token %}
+<input type="hidden" id="analysis-action-token" value="{{ action_token }}">
+<p id="analysis-result" role="status" aria-live="polite"></p>
+<script>
+(() => {
+  const token = document.getElementById("analysis-action-token").value;
+  const result = document.getElementById("analysis-result");
+  const allowed = new Set([
+    "completed", "completed_replay", "in_progress", "retry_required",
+    "retry_not_available", "blocked", "invalid_request", "invalid_target",
+    "unavailable", "disabled", "credential_missing", "credential_unavailable",
+    "no_analyzable_body", "failed_retryable", "stale_retryable", "invalid_security"
+  ]);
+  for (const button of document.querySelectorAll(".analysis-action")) {
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        const response = await fetch(button.dataset.path, {
+          method: "POST", credentials: "same-origin",
+          headers: {"Content-Type": "application/json", "X-CSRF-Token": token},
+          body: JSON.stringify({source_record_id: Number(button.dataset.sourceId)})
+        });
+        const data = await response.json();
+        result.textContent = allowed.has(data.status) ? data.status : "unavailable";
+      } catch (_) {
+        result.textContent = "unavailable";
+      } finally {
+        button.disabled = false;
+      }
+    });
+  }
+})();
+</script>
+{% endif %}

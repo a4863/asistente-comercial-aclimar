@@ -33,7 +33,8 @@ from app.persistence.repositories import (
     AnalysisRepository, AnalysisRepositoryError,
 )
 from app.services.email_analysis import (
-    FakeAIService, analyze_email_in_thread,
+    AnalysisServiceError, FakeAIService, analyze_email_in_thread,
+    list_manual_analysis_options,
 )
 
 
@@ -281,6 +282,83 @@ def test_matching_reserved_run_returns_in_progress_without_provider(analysis_db)
     fake = FakeAIService()
     result = analyze_email_in_thread(analysis_db, fake, "imap:test", target_id)
     assert result.status == "in_progress" and fake.calls == []
+
+
+def test_manual_selector_derives_state_from_current_input_only(analysis_db):
+    target_id, _, _ = _seed(analysis_db)
+    options = list_manual_analysis_options(analysis_db, "imap:test")
+    assert len(options) == 1 and options[0].state == "ready"
+    assert options[0].source_record_id == target_id
+    assert not hasattr(options[0], "input_digest")
+    assert not hasattr(options[0], "body")
+    fake = FakeAIService(fail=True)
+    assert analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                   request_mode="manual", manual_intent="initial").status == "failed_retryable"
+    assert list_manual_analysis_options(analysis_db, "imap:test")[0].state == "retry_required"
+    with analysis_db() as session, session.begin():
+        email = session.scalar(select(EmailMessage).where(
+            EmailMessage.source_record_id == target_id))
+        email.normalized_body = "Changed current input"
+    assert list_manual_analysis_options(analysis_db, "imap:test")[0].state == "ready"
+
+
+def test_manual_initial_retry_replay_and_changed_input_are_enforced_in_service(analysis_db):
+    target_id, _, _ = _seed(analysis_db)
+    fake = FakeAIService(fail=True)
+    initial = analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                      request_mode="manual", manual_intent="initial")
+    assert initial.status == "failed_retryable" and len(fake.calls) == 1
+    again = analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                    request_mode="manual", manual_intent="initial")
+    assert again.status == "retry_required" and len(fake.calls) == 1 and len(_runs(analysis_db)) == 1
+    fake.fail = False
+    retried = analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                      request_mode="manual", manual_intent="retry")
+    assert retried.status == "completed" and len(fake.calls) == 2
+    assert [run.run_version for run in _runs(analysis_db)] == [1, 2]
+    assert analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                   request_mode="manual", manual_intent="initial").status == "completed_replay"
+    assert analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                   request_mode="manual", manual_intent="retry").status == "completed_replay"
+    assert len(fake.calls) == 2
+
+
+def test_manual_retry_without_retryable_state_never_calls_provider(analysis_db):
+    target_id, _, _ = _seed(analysis_db)
+    fake = FakeAIService()
+    result = analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                     request_mode="manual", manual_intent="retry")
+    assert result.status == "retry_not_available"
+    assert fake.calls == [] and _runs(analysis_db) == []
+    with pytest.raises(AnalysisServiceError):
+        analyze_email_in_thread(analysis_db, fake, "imap:test", target_id,
+                                manual_intent="retry")
+
+
+def test_competing_manual_retry_sees_reserved_run_without_second_provider(analysis_db):
+    target_id, _, _ = _seed(analysis_db)
+    first = analyze_email_in_thread(analysis_db, FakeAIService(fail=True),
+                                    "imap:test", target_id, request_mode="manual",
+                                    manual_intent="initial")
+    assert first.status == "failed_retryable"
+
+    class CompetingProvider:
+        calls = 0
+
+        def analyze(self, _analysis_input):
+            self.calls += 1
+            competitor = analyze_email_in_thread(analysis_db, FakeAIService(),
+                                                  "imap:test", target_id,
+                                                  request_mode="manual",
+                                                  manual_intent="retry")
+            assert competitor.status == "in_progress"
+            return AnalysisCandidates()
+
+    provider = CompetingProvider()
+    result = analyze_email_in_thread(analysis_db, provider, "imap:test", target_id,
+                                     request_mode="manual", manual_intent="retry")
+    assert result.status == "completed" and provider.calls == 1
+    assert [run.run_version for run in _runs(analysis_db)] == [1, 2]
 
 
 def test_target_without_body_never_reserves_or_calls_provider(analysis_db):

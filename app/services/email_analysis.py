@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import select
@@ -54,12 +55,65 @@ class AnalysisResult:
     failure_code: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ManualAnalysisOption:
+    source_record_id: int
+    sender: str
+    subject: str
+    message_date: str
+    state: str
+
+
 class AnalysisServiceError(ValueError):
     """Safe pre-reservation failure with no raw source or SQL text."""
 
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+def _safe_label(value: str | None, limit: int, fallback: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return fallback
+    return "".join(" " if ord(character) < 32 or ord(character) == 127 else character
+                   for character in value)[:limit]
+
+
+def list_manual_analysis_options(session_factory, account_scope: str, *,
+                                 limit: int = 20) -> tuple[ManualAnalysisOption, ...]:
+    """Read a bounded local selector; never return bodies or canonical digests."""
+    try:
+        with session_factory() as session, session.begin():
+            repository = AnalysisRepository(session)
+            refs = repository.list_eligible_email_refs(account_scope, limit=limit)
+            options = []
+            for ref in refs:
+                try:
+                    current = select_analysis_input(session, account_scope, ref.source_record_id)
+                except (AnalysisDomainError, NoAnalyzableBody):
+                    continue
+                digest = current.input_digest
+                latest = repository.latest_run_for_target(account_scope, ref.source_record_id)
+                matching = (latest is not None and
+                            (latest.input_digest, latest.contract_version, latest.policy_version)
+                            == (digest, current.contract_version, current.policy_version))
+                if matching and latest.status == "reserved":
+                    state = "in_progress"
+                elif repository.replay_lookup(account_scope, ref.source_record_id, digest,
+                                              current.contract_version, current.policy_version):
+                    state = "completed"
+                elif matching and latest.status in {"failed_retryable", "stale_retryable"}:
+                    state = "retry_required"
+                else:
+                    state = "ready"
+                date = ref.message_date
+                date_label = date.isoformat()[:35] if isinstance(date, datetime) else "unknown"
+                options.append(ManualAnalysisOption(
+                    ref.source_record_id, _safe_label(ref.sender, 120, "Unknown sender"),
+                    _safe_label(ref.subject, 160, "No subject"), date_label, state))
+            return tuple(options)
+    except (SQLAlchemyError, AnalysisRepositoryError) as error:
+        raise AnalysisServiceError("persistence_failure") from None
 
 
 def _conversation_id(session, source_record_id: int) -> int:
@@ -106,14 +160,34 @@ def _mark_retryable(session_factory, run_id: int, input_digest: str, *,
                               "persistence_failure")
 
 
+def _manual_conflict_result(session_factory, account_scope: str, target_source_record_id: int,
+                            input_digest: str, contract_version: int,
+                            policy_version: int) -> AnalysisResult:
+    try:
+        with session_factory() as session:
+            latest = AnalysisRepository(session).latest_run_for_target(
+                account_scope, target_source_record_id)
+            if (latest is not None and latest.status == "reserved" and
+                    (latest.input_digest, latest.contract_version, latest.policy_version) ==
+                    (input_digest, contract_version, policy_version)):
+                return AnalysisResult("in_progress", latest.id, input_digest)
+    except SQLAlchemyError:
+        pass
+    return AnalysisResult("unavailable")
+
+
 def analyze_email_in_thread(session_factory, ai_service: AIService,
                             account_scope: str, target_source_record_id: int, *,
                             request_mode: str = "automatic", contract_version: int = 1,
                             policy_version: int = 1,
-                            force_reanalysis: bool = False) -> AnalysisResult:
+                            force_reanalysis: bool = False,
+                            manual_intent: str | None = None) -> AnalysisResult:
     """Reserve, call AI outside any session, then revalidate and append atomically."""
     mode = "force" if force_reanalysis else request_mode
     if mode not in {"automatic", "manual", "force"}:
+        raise AnalysisServiceError("invalid_request_mode")
+    if manual_intent is not None and (mode != "manual" or
+                                      manual_intent not in {"initial", "retry"}):
         raise AnalysisServiceError("invalid_request_mode")
     try:
         with session_factory() as session:
@@ -123,15 +197,30 @@ def analyze_email_in_thread(session_factory, ai_service: AIService,
                     contract_version=contract_version, policy_version=policy_version)
                 snapshot = _snapshot(session, analysis_input)
                 conversation_id = _conversation_id(session, target_source_record_id)
-                reservation = AnalysisRepository(session).reserve_run(
-                    account_scope, target_source_record_id, conversation_id,
-                    analysis_input.input_digest, contract_version, policy_version, mode)
-                run_id = reservation.run.id
-                run_conversation_id = reservation.run.conversation_id
+                repository = AnalysisRepository(session)
+                if manual_intent is None:
+                    reservation = repository.reserve_run(
+                        account_scope, target_source_record_id, conversation_id,
+                        analysis_input.input_digest, contract_version, policy_version, mode)
+                else:
+                    reservation = repository.reserve_manual_run(
+                        account_scope, target_source_record_id, conversation_id,
+                        analysis_input.input_digest, contract_version, policy_version,
+                        intent=manual_intent)
+                run_id = reservation.run.id if reservation.run is not None else None
+                run_conversation_id = (reservation.run.conversation_id
+                                       if reservation.run is not None else None)
                 outcome = reservation.outcome
     except NoAnalyzableBody:
         return AnalysisResult("no_analyzable_body")
-    except (AnalysisDomainError, AnalysisRepositoryError, AnalysisServiceError) as error:
+    except AnalysisRepositoryError as error:
+        if error.code == "reservation_conflict" and manual_intent is not None:
+            return _manual_conflict_result(session_factory, account_scope,
+                                           target_source_record_id, analysis_input.input_digest,
+                                           contract_version, policy_version)
+        raise AnalysisServiceError("invalid_target" if error.code == "invalid_target"
+                                   else "invalid_analysis_request") from None
+    except (AnalysisDomainError, AnalysisServiceError) as error:
         raise AnalysisServiceError("invalid_target" if getattr(error, "code", "") in {
             "invalid_target", "invalid_conversation"} else "invalid_analysis_request") from None
     except SQLAlchemyError:
@@ -141,6 +230,10 @@ def analyze_email_in_thread(session_factory, ai_service: AIService,
         return AnalysisResult("completed_replay", run_id, analysis_input.input_digest)
     if outcome == "in_progress":
         return AnalysisResult("in_progress", run_id, analysis_input.input_digest)
+    if outcome in {"retry_required", "retry_not_available"}:
+        return AnalysisResult(outcome, run_id, analysis_input.input_digest)
+
+    assert run_id is not None and run_conversation_id is not None
 
     # The reservation transaction has committed and its Session is closed here.
     try:
