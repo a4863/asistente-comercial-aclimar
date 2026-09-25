@@ -269,3 +269,27 @@ Approved:
 - A successful smoke does not imply EU residency, ZDR, retention guarantees, compliance approval or permission for commercial-data processing.
 - Real live smoke execution remains separately authorized under Phase 6F; Phase 6D implementation and pytest remain offline/faked.
 - No environment-variable bypass, public synthetic flag, temporary commercial-gate enablement, caller-constructible token or duplicate provider implementation is permitted.
+
+
+## D16 — Manual analysis target selection
+
+Approved:
+- The user selects an existing eligible email from a bounded read-only browser list; the user does not type internal `account_scope` or `source_record_id`.
+- The UI may display only safe identifying metadata needed to choose the correct target, such as sender, subject, message date and bounded analysis state.
+- Internal source identity may travel server-side/in the protected action payload but is not an operator-entered key.
+- Selection/listing must use an explicit repository/service read contract; no ad-hoc SQL in the route.
+- The selector is local-only and must not expose message body, provider payload, digests, credentials or internal lock details.
+- The implementation may expand the 6E2 Scope Lock to the repository and repository tests as needed, but requires no model/migration.
+
+## D17 — Explicit retry after retryable analysis outcome
+
+Approved:
+- A normal repeated `Analyze` action must not silently create another provider disclosure after an existing `failed_retryable` or `stale_retryable` result.
+- After a retryable outcome, the UI must expose a distinct explicit `Retry analysis` action.
+- Only that explicit retry action authorizes a new analysis version/provider attempt for the same current input.
+- `completed_replay` remains a no-new-provider outcome.
+- `in_progress` remains a no-new-provider outcome.
+- Initial manual analysis uses non-force semantics.
+- Retry is not force reanalysis; `force_reanalysis` remains out of scope.
+- No new persistent request-id/idempotency table is introduced for 6E2.
+- The route/service must enforce the distinction server-side; UI labels alone are insufficient.
