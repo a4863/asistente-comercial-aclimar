@@ -249,3 +249,23 @@ Approved:
 - If `ConfigurationReference` cannot support this safely under its existing constraints/repository access, STOP and request a new data-model decision instead of repurposing another table.
 
 This decision supersedes the earlier assumption that first deployment could rely on an operator-only quiescence invariant without a persistent boundary marker.
+
+
+## D15 — Synthetic smoke public boundary
+
+Approved:
+- Add a dedicated `OpenAIAnalysis.smoke()` public method with **no caller-supplied payload, AnalysisInput, mode, token or arbitrary text argument**.
+- `smoke()` constructs one fixed immutable non-commercial synthetic `AnalysisInput` internally.
+- Commercial `OpenAIAnalysis.analyze(AnalysisInput)` remains unchanged as the commercial entry point and continues to require operational ownership plus commercial gate ON.
+- Smoke must **never read, enable or mutate** the commercial activation gate.
+- Smoke requires technical AI enabled and valid operational single-instance ownership.
+- Smoke reuses the same private provider execution mechanics as commercial analysis: endpoint allowlist, configured model, credential reference, request-size limits, strict Responses JSON Schema, decoder, max output tokens, store=false, no tools/functions, bounded timeout/retry/error handling.
+- Ownership is rechecked before the first smoke provider attempt and before every retry after any delay.
+- The smoke method is one-shot per adapter instance; a second call fails with a bounded local code.
+- The exact synthetic payload is fixed in adapter code and snapshot-tested. It contains no IMAP/CRM/Calendar/SQLite commercial source data and no externally supplied fields.
+- The dedicated CLI acquires the same `SingleInstanceLock(settings.database_url)`; if another operational owner exists, smoke fails closed.
+- The CLI accepts no request content/data argument and does not read commercial SQLite rows or source selectors.
+- Smoke result is transient/process-local only and is not persisted.
+- A successful smoke does not imply EU residency, ZDR, retention guarantees, compliance approval or permission for commercial-data processing.
+- Real live smoke execution remains separately authorized under Phase 6F; Phase 6D implementation and pytest remain offline/faked.
+- No environment-variable bypass, public synthetic flag, temporary commercial-gate enablement, caller-constructible token or duplicate provider implementation is permitted.
