@@ -225,3 +225,27 @@ Approved following `docs/plans/phase-6-single-instance-analysis.md`:
 - If these constraints cannot be enforced or verified in implementation tests, STOP and fall back to separately approved persistent per-run ownership.
 
 This decision does not authorize live provider calls or commercial-data processing.
+
+
+## D14 — Persistent lock-aware cutover marker
+
+Approved:
+- Reuse the existing `ConfigurationReference` model as the persistent marker for the transition into the lock-aware runtime era.
+- No new table, column or migration is introduced for this purpose.
+- The marker must contain only bounded non-sensitive configuration metadata.
+- The marker may be created only while the process holds the exclusive operational single-instance lock.
+- First lock-aware startup behavior:
+  1. acquire the operational lock;
+  2. check for the cutover marker;
+  3. if marker is absent, inspect `AnalysisRun(status='reserved')`;
+  4. if any reserved row exists, fail startup closed and modify no analysis run;
+  5. if zero reserved rows exist, create the cutover marker atomically.
+- Once the marker exists, any later startup that successfully acquires the operational lock may treat inherited `reserved` rows as belonging to a prior lock-aware instance and transition them atomically/idempotently to `failed_retryable / interrupted`.
+- Do not use age, PID, heartbeat, timeout or other heuristics to infer orphanhood.
+- Marker absent + any reserved row = operator intervention required; automatic recovery is prohibited.
+- Before the first lock-aware cutover attempt, the operator must stop and verify that all pre-lock application instances/provider calls are quiescent.
+- The cutover marker is not commercial authorization, not AI enablement, not provider consent and not a smoke-test result.
+- Marker creation and recovery must be covered by isolated SQLite tests.
+- If `ConfigurationReference` cannot support this safely under its existing constraints/repository access, STOP and request a new data-model decision instead of repurposing another table.
+
+This decision supersedes the earlier assumption that first deployment could rely on an operator-only quiescence invariant without a persistent boundary marker.
