@@ -11,6 +11,18 @@ from app.integrations.openai_analysis import OpenAIAnalysisError
 from app.security.single_instance import SingleInstanceError
 
 
+ALLOWED_DIAGNOSTICS = (
+    "credential_missing", "credential_unavailable", "provider_unavailable",
+    "provider_auth", "provider_quota", "provider_transient_exhausted",
+    "provider_failure", "timeout", "provider_incomplete", "provider_refusal",
+    "invalid_output", "invalid_configuration",
+)
+EXCLUDED_DIAGNOSTICS = (
+    "operational_ownership_required", "commercial_activation_required", "busy",
+    "smoke_already_used", "sensitive_content", "invalid_input", "disabled",
+)
+
+
 @pytest.fixture
 def smoke_fakes(monkeypatch):
     events = []
@@ -136,6 +148,74 @@ def test_cli_releases_lock_and_bounds_all_failures(smoke_fakes, monkeypatch, cap
     assert events[-1] == "lock_release"
 
 
+@pytest.mark.parametrize("code", ALLOWED_DIAGNOSTICS)
+def test_cli_reports_only_allowlisted_adapter_diagnostics(
+        smoke_fakes, monkeypatch, capsys, caplog, code):
+    events, _settings = smoke_fakes
+
+    class FailingAdapter:
+        def __init__(self, *_args, **_kwargs):
+            events.append("adapter_construct")
+
+        def smoke(self):
+            events.append("smoke")
+            raise OpenAIAnalysisError(code)
+
+    monkeypatch.setattr(ai_smoke_cli, "OpenAIAnalysis", FailingAdapter)
+    assert ai_smoke_cli.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == f"smoke_failed:{code}\n"
+    assert captured.err == "" and caplog.text == ""
+    assert events == ["lock_construct", "lock_acquire", "adapter_construct",
+                      "smoke", "lock_release"]
+
+
+@pytest.mark.parametrize("code", EXCLUDED_DIAGNOSTICS + (
+    "unknown_provider_code", "raw-commercial-secret", "raw-provider-body",
+    "C:/private/credential.txt", "https://evil.example/v1", "", "provider_auth_extra",
+    "provider_auth\nraw-provider-body", "provider_quota\rraw-provider-body",
+    "provider_failure\traw-provider-body", None, 401, ["provider_auth"],
+    {"code": "provider_auth"},
+))
+def test_cli_collapses_excluded_unknown_and_unhashable_codes(
+        smoke_fakes, monkeypatch, capsys, caplog, code):
+    events, _settings = smoke_fakes
+
+    class FailingAdapter:
+        def __init__(self, *_args, **_kwargs):
+            events.append("adapter_construct")
+
+        def smoke(self):
+            events.append("smoke")
+            raise OpenAIAnalysisError(code)
+
+    monkeypatch.setattr(ai_smoke_cli, "OpenAIAnalysis", FailingAdapter)
+    assert ai_smoke_cli.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "smoke_failed\n"
+    assert captured.err == "" and caplog.text == ""
+    assert events == ["lock_construct", "lock_acquire", "adapter_construct",
+                      "smoke", "lock_release"]
+
+
+def test_cli_preserves_generic_non_passed_result(smoke_fakes, monkeypatch, capsys):
+    events, _settings = smoke_fakes
+
+    class NonPassedAdapter:
+        def __init__(self, *_args, **_kwargs):
+            events.append("adapter_construct")
+
+        def smoke(self):
+            events.append("smoke")
+            return "not_passed"
+
+    monkeypatch.setattr(ai_smoke_cli, "OpenAIAnalysis", NonPassedAdapter)
+    assert ai_smoke_cli.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "smoke_failed\n" and captured.err == ""
+    assert events[-1] == "lock_release"
+
+
 def test_cli_has_no_commercial_gate_or_database_session_access(smoke_fakes, monkeypatch):
     import sqlalchemy
     from app.security.activation import CommercialActivationGate
@@ -144,6 +224,8 @@ def test_cli_has_no_commercial_gate_or_database_session_access(smoke_fakes, monk
         pytest.fail("forbidden gate/database access")
 
     monkeypatch.setattr(sqlalchemy, "create_engine", forbidden)
+    monkeypatch.setattr(CommercialActivationGate, "is_enabled",
+                        property(lambda _self: forbidden()))
     monkeypatch.setattr(CommercialActivationGate, "enable", forbidden)
     monkeypatch.setattr(CommercialActivationGate, "disable", forbidden)
     assert ai_smoke_cli.main([]) == 0

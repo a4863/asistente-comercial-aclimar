@@ -9,6 +9,20 @@ from app.security.single_instance import SingleInstanceError, SingleInstanceLock
 
 
 _USAGE = "Usage: asistente-aclimar-ai-smoke"
+_DIAGNOSTIC_CODES = frozenset({
+    "credential_missing",
+    "credential_unavailable",
+    "provider_unavailable",
+    "provider_auth",
+    "provider_quota",
+    "provider_transient_exhausted",
+    "provider_failure",
+    "timeout",
+    "provider_incomplete",
+    "provider_refusal",
+    "invalid_output",
+    "invalid_configuration",
+})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,8 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     except SingleInstanceError:
         print("lock_unavailable")
         return 1
-    except OpenAIAnalysisError:
-        print("smoke_failed")
+    except OpenAIAnalysisError as error:
+        code = error.code
+        if type(code) is str and code in _DIAGNOSTIC_CODES:
+            print(f"smoke_failed:{code}")
+        else:
+            print("smoke_failed")
         return 1
     except Exception:
         print("unavailable")
