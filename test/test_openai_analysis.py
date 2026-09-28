@@ -6,11 +6,13 @@ from hashlib import sha256
 import json
 import inspect
 import logging
+import ssl
 import sys
 import threading
 from types import SimpleNamespace
 
 import httpx2
+import httpcore2
 import openai as installed_openai
 import pytest
 
@@ -34,7 +36,15 @@ def _enabled_gate():
     return gate
 
 
-class APIConnectionError(Exception):
+class OpenAIError(Exception):
+    pass
+
+
+class APIError(OpenAIError):
+    pass
+
+
+class APIConnectionError(APIError):
     pass
 
 
@@ -42,7 +52,7 @@ class APITimeoutError(APIConnectionError):
     pass
 
 
-class APIStatusError(Exception):
+class APIStatusError(APIError):
     def __init__(self, status_code, code=None, retry_after=None):
         super().__init__("raw provider error: synthetic-secret-and-body")
         self.status_code = status_code
@@ -59,13 +69,15 @@ class AuthenticationError(APIStatusError):
     pass
 
 
-class APIResponseValidationError(Exception):
+class APIResponseValidationError(APIError):
     pass
 
 
 @pytest.fixture(autouse=True)
 def fake_openai_module(monkeypatch):
     module = SimpleNamespace(OpenAI=lambda **kwargs: None,
+                             OpenAIError=OpenAIError,
+                             APIError=APIError,
                              APIConnectionError=APIConnectionError,
                              APITimeoutError=APITimeoutError,
                              APIStatusError=APIStatusError,
@@ -379,22 +391,82 @@ def test_exact_sdk_failures_are_bounded_and_non_retryable(error, expected, caplo
     assert isinstance(_adapter(factory=FakeFactory()).analyze(_input()), AnalysisCandidates)
 
 
-@pytest.mark.parametrize("error", [
-    type("CustomValidationError", (APIResponseValidationError,), {})("synthetic-secret"),
-    type("CustomJSONDecodeError", (json.JSONDecodeError,), {})(
-        "synthetic-secret", "synthetic-document", 0),
-    type("CustomTypeError", (TypeError,), {})("synthetic-secret"),
-    type("CustomValueError", (ValueError,), {})("synthetic-secret"),
-    type("CustomRuntimeError", (RuntimeError,), {})("synthetic-secret"),
-    Exception("synthetic-secret"),
+class CustomValidationError(APIResponseValidationError):
+    pass
+
+
+class CustomJSONDecodeError(json.JSONDecodeError):
+    pass
+
+
+class CustomTypeError(TypeError):
+    pass
+
+
+class CustomValueError(ValueError):
+    pass
+
+
+class CustomRuntimeError(RuntimeError):
+    pass
+
+
+class UnrelatedError(Exception):
+    pass
+
+
+@pytest.mark.parametrize("error, expected", [
+    (OpenAIError("synthetic-secret"), "provider_openai_error_family"),
+    (APIError("synthetic-secret"), "provider_openai_error_family"),
+    (CustomValidationError("synthetic-secret"), "provider_openai_error_family"),
+    (httpx2.RequestError("synthetic-secret"), "provider_http_client_error_family"),
+    (httpx2.ProtocolError("synthetic-secret"), "provider_http_client_error_family"),
+    (httpx2.DecodingError("synthetic-secret"), "provider_http_client_error_family"),
+    (OSError("synthetic-secret"), "provider_os_error_family"),
+    (ssl.SSLCertVerificationError("synthetic-secret"), "provider_os_error_family"),
+    (UnicodeError("synthetic-secret"), "provider_value_subclass_family"),
+    (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "synthetic-secret"),
+     "provider_value_subclass_family"),
+    (CustomJSONDecodeError("synthetic-secret", "synthetic-document", 0),
+     "provider_value_subclass_family"),
+    (CustomValueError("synthetic-secret"), "provider_value_subclass_family"),
+    (CustomTypeError("synthetic-secret"), "provider_python_internal_family"),
+    (CustomRuntimeError("synthetic-secret"), "provider_python_internal_family"),
+    (AttributeError("synthetic-secret"), "provider_python_internal_family"),
+    (KeyError("synthetic-secret"), "provider_python_internal_family"),
+    (IndexError("synthetic-secret"), "provider_python_internal_family"),
+    (AssertionError("synthetic-secret"), "provider_python_internal_family"),
+    (ExceptionGroup("synthetic-secret", [ValueError("synthetic-secret")]),
+     "provider_exception_group_family"),
+    (httpcore2.ConnectError("synthetic-secret"), "provider_non_http_failure"),
+    (UnrelatedError("synthetic-secret"), "provider_non_http_failure"),
 ])
-def test_unknown_non_http_subclasses_keep_generic_fallback(error):
+def test_residual_sdk_error_families_are_bounded_and_non_retryable(
+        error, expected, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
     factory = FakeFactory([error])
+    sleeps = []
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory, sleep=sleeps.append).analyze(_input())
+    assert caught.value.code == expected
+    assert len(factory.responses.calls) == 1
+    assert sleeps == []
+    captured = capsys.readouterr()
+    bounded = str(caught.value) + repr(caught.value) + captured.out + captured.err + caplog.text
+    assert "synthetic-secret" not in bounded
+    assert isinstance(_adapter(factory=FakeFactory()).analyze(_input()), AnalysisCandidates)
+
+
+def test_raw_http_status_error_is_not_broadly_classified_as_request_error():
+    request = httpx2.Request("GET", "https://synthetic.invalid/v1/responses")
+    response = httpx2.Response(400, request=request)
+    factory = FakeFactory([httpx2.HTTPStatusError(
+        "synthetic-secret", request=request, response=response,
+    )])
     with pytest.raises(OpenAIAnalysisError) as caught:
         _adapter(factory=factory).analyze(_input())
     assert caught.value.code == "provider_non_http_failure"
     assert len(factory.responses.calls) == 1
-    assert "synthetic-secret" not in str(caught.value)
 
 
 @pytest.mark.parametrize("forged_status", [400, 429, 503])
@@ -585,6 +657,37 @@ def test_pinned_sdk_pre_send_type_failure_has_zero_dispatch(monkeypatch):
     assert seen == []
 
 
+def test_pinned_sdk_pre_send_structural_family_has_zero_dispatch(monkeypatch):
+    class BrokenBuildClient(httpx2.Client):
+        def build_request(self, *args, **kwargs):
+            raise AttributeError("synthetic-secret-and-body")
+
+    code, seen = _pinned_sdk_smoke_failure(
+        monkeypatch, lambda _request: pytest.fail("mock transport reached"),
+        http_client_type=BrokenBuildClient,
+    )
+    assert code == "provider_python_internal_family"
+    assert seen == []
+
+
+@pytest.mark.parametrize("error, expected", [
+    (installed_openai.OpenAIError("synthetic-secret-and-body"),
+     "provider_openai_error_family"),
+    (OSError("synthetic-secret-and-body"), "provider_os_error_family"),
+    (AttributeError("synthetic-secret-and-body"), "provider_python_internal_family"),
+    (httpcore2.ConnectError("synthetic-secret-and-body"),
+     "provider_non_http_failure"),
+])
+def test_pinned_sdk_injected_residual_families_stay_bounded_without_network(
+        monkeypatch, error, expected):
+    def fail(_request):
+        raise error
+
+    code, seen = _pinned_sdk_smoke_failure(monkeypatch, fail)
+    assert code == expected
+    assert seen == [("POST", "/v1/responses")]
+
+
 @pytest.mark.parametrize("error, expected", [
     (ValueError("synthetic-secret-and-body"), "provider_sdk_value_failure"),
     (RuntimeError("synthetic-secret-and-body"), "provider_sdk_runtime_failure"),
@@ -603,6 +706,7 @@ def test_pinned_sdk_non_request_transport_exception_stays_bounded(
     (httpx2.ConnectError, "provider_transient_exhausted"),
     (httpx2.ConnectTimeout, "timeout"),
     (httpx2.ProxyError, "provider_transient_exhausted"),
+    (httpx2.DecodingError, "provider_transient_exhausted"),
 ])
 def test_pinned_sdk_transport_errors_keep_existing_categories(
         monkeypatch, error_type, expected):

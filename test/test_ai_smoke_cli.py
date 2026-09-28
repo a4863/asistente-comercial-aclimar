@@ -22,6 +22,9 @@ ALLOWED_DIAGNOSTICS = (
     "provider_response_validation_failure", "provider_response_json_failure",
     "provider_sdk_type_failure", "provider_sdk_value_failure",
     "provider_sdk_runtime_failure",
+    "provider_openai_error_family", "provider_http_client_error_family",
+    "provider_os_error_family", "provider_value_subclass_family",
+    "provider_python_internal_family", "provider_exception_group_family",
 )
 EXCLUDED_DIAGNOSTICS = (
     "operational_ownership_required", "commercial_activation_required", "busy",

@@ -238,6 +238,7 @@ class OpenAIAnalysis:
                 _raise("credential_missing")
             try:
                 import openai
+                import httpx2
                 factory = self._client_factory or openai.OpenAI
                 client = factory(api_key=secret, base_url=settings.base_url,
                                  max_retries=0, timeout=max(_MIN_ATTEMPT_SECONDS, deadline - self._clock()))
@@ -310,6 +311,19 @@ class OpenAIAnalysis:
                         category, transient = "provider_sdk_value_failure", False
                     elif type(error) is RuntimeError:
                         category, transient = "provider_sdk_runtime_failure", False
+                    elif isinstance(error, openai.OpenAIError):
+                        category, transient = "provider_openai_error_family", False
+                    elif isinstance(error, httpx2.RequestError):
+                        category, transient = "provider_http_client_error_family", False
+                    elif isinstance(error, OSError):
+                        category, transient = "provider_os_error_family", False
+                    elif isinstance(error, ValueError):
+                        category, transient = "provider_value_subclass_family", False
+                    elif isinstance(error, (TypeError, RuntimeError, AttributeError,
+                                            LookupError, AssertionError)):
+                        category, transient = "provider_python_internal_family", False
+                    elif isinstance(error, ExceptionGroup):
+                        category, transient = "provider_exception_group_family", False
                     else:
                         category, transient = "provider_non_http_failure", False
                     if not transient or attempt >= settings.max_retries:
