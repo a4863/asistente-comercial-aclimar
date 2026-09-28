@@ -18,6 +18,7 @@ ALLOWED_DIAGNOSTICS = (
     "invalid_output", "invalid_configuration",
     "provider_bad_request", "provider_not_found", "provider_conflict",
     "provider_unprocessable", "provider_client_error", "provider_non_http_failure",
+    "request_schema_failure",
 )
 EXCLUDED_DIAGNOSTICS = (
     "operational_ownership_required", "commercial_activation_required", "busy",

@@ -10,11 +10,16 @@ import sys
 import threading
 from types import SimpleNamespace
 
+import httpx2
+import openai as installed_openai
 import pytest
 
 from app.config import AISettings
 from app.domain.email_analysis import AnalysisCandidates, AnalysisInput, SelectedMessage
-from app.integrations.openai_analysis import OpenAIAnalysis, OpenAIAnalysisError
+from app.integrations.ai_schema import project_analysis_input, response_schema
+from app.integrations.openai_analysis import (
+    OpenAIAnalysis, OpenAIAnalysisError, _INSTRUCTIONS, _fixed_smoke_input,
+)
 from app.security.activation import CommercialActivationGate
 
 
@@ -239,9 +244,15 @@ def test_request_uses_responses_strict_schema_and_minimized_untrusted_input(capl
     assert call["max_output_tokens"] == 900
     assert call["store"] is False
     assert 0 < call["timeout"] <= 60
+    assert set(call) == {"model", "instructions", "input", "text", "max_output_tokens",
+                         "store", "timeout"}
+    assert call["instructions"] == _INSTRUCTIONS
     assert call["text"]["format"]["type"] == "json_schema"
     assert call["text"]["format"]["strict"] is True
     assert call["text"]["format"]["schema"]["additionalProperties"] is False
+    assert call["text"] == {"format": {"type": "json_schema",
+                                      "name": "commercial_analysis_v1", "strict": True,
+                                      "schema": response_schema()}}
     assert not set(call) & {"tools", "tool_choice", "functions", "stream"}
     assert "Need a quote?" not in call["instructions"]
     assert "Need a quote?" in call["input"][0]["content"]
@@ -363,19 +374,119 @@ def test_non_http_exception_cannot_forge_status_classification(forged_status):
     assert "raw-provider-body" not in str(caught.value)
 
 
-def test_local_schema_construction_failure_is_non_http(monkeypatch):
+def test_local_schema_construction_failure_is_bounded_without_sdk_call_or_retry(
+        monkeypatch, capsys, caplog):
     import app.integrations.openai_analysis as adapter_module
 
+    caplog.set_level(logging.DEBUG)
+    original_schema = adapter_module.response_schema
+    sleeps = []
+
     def broken_schema():
-        raise TypeError("raw-provider-body\nsynthetic-secret-and-body")
+        raise TypeError("raw-provider-body\nsynthetic-secret-and-body "
+                        "https://private.example/secret C:/private/credential.txt")
 
     monkeypatch.setattr(adapter_module, "response_schema", broken_schema)
     factory = FakeFactory()
+    adapter = _adapter(factory=factory, sleep=sleeps.append)
     with pytest.raises(OpenAIAnalysisError) as caught:
-        _adapter(factory=factory).analyze(_input())
-    assert caught.value.code == "provider_non_http_failure"
+        adapter.analyze(_input())
+    assert caught.value.code == "request_schema_failure"
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
     assert factory.responses.calls == []
-    assert "raw-provider-body" not in str(caught.value)
+    assert sleeps == []
+    captured = capsys.readouterr()
+    bounded = str(caught.value) + repr(caught.value) + captured.out + captured.err + caplog.text
+    for forbidden in ("raw-provider-body", "synthetic-secret-and-body", "private.example",
+                      "C:/private/credential.txt", "\n"):
+        assert forbidden not in bounded
+    monkeypatch.setattr(adapter_module, "response_schema", original_schema)
+    assert isinstance(adapter.analyze(_input()), AnalysisCandidates)
+    assert len(factory.responses.calls) == 1
+
+
+def test_transient_retry_rebuilds_schema_and_reauthorizes(monkeypatch):
+    import app.integrations.openai_analysis as adapter_module
+
+    original_schema = adapter_module.response_schema
+    schema_calls = []
+
+    def counted_schema():
+        schema_calls.append(True)
+        return original_schema()
+
+    class CountingOwnership:
+        checks = 0
+
+        @property
+        def is_owner(self):
+            self.checks += 1
+            return True
+
+    class CountingGate:
+        checks = 0
+
+        @property
+        def is_enabled(self):
+            self.checks += 1
+            return True
+
+    monkeypatch.setattr(adapter_module, "response_schema", counted_schema)
+    factory = FakeFactory([APIConnectionError("synthetic"), _response()])
+    ownership, gate = CountingOwnership(), CountingGate()
+    adapter = _adapter(factory=factory, ownership=ownership, commercial_gate=gate,
+                       sleep=lambda _: None)
+    assert isinstance(adapter.analyze(_input()), AnalysisCandidates)
+    assert len(schema_calls) == len(factory.responses.calls) == 2
+    assert ownership.checks == gate.checks == 3
+    first, second = factory.responses.calls
+    assert {key: value for key, value in first.items() if key != "timeout"} == {
+        key: value for key, value in second.items() if key != "timeout"
+    }
+    assert 0 < second["timeout"] <= first["timeout"] <= 60
+
+
+def test_fixed_smoke_request_serializes_with_pinned_sdk_and_no_network(monkeypatch):
+    assert installed_openai.__version__ == "3.17.0"
+    monkeypatch.setitem(sys.modules, "openai", installed_openai)
+    seen = []
+
+    def no_send(request):
+        body = json.loads(request.content)
+        seen.append((request.method, request.url.path, body))
+        return httpx2.Response(200, json={"id": "resp_synthetic", "object": "response",
+                                          "status": "completed", "output": []})
+
+    settings = AISettings(enabled=True, model="gpt-6-sol",
+                          base_url="https://api.openai.com/v1", max_output_tokens=4096)
+    credentials = FakeCredentials("synthetic-offline-only")
+    with httpx2.Client(transport=httpx2.MockTransport(no_send)) as http_client:
+        def factory(**kwargs):
+            assert kwargs["api_key"] == "synthetic-offline-only"
+            assert kwargs["max_retries"] == 0
+            return installed_openai.OpenAI(**kwargs, http_client=http_client)
+
+        adapter = OpenAIAnalysis(settings, credentials, ownership=FakeOwnership(),
+                                 client_factory=factory)
+        with pytest.raises(OpenAIAnalysisError) as caught:
+            adapter.smoke()
+    assert caught.value.code == "invalid_output"
+    assert len(seen) == 1
+    method, path, body = seen[0]
+    assert (method, path) == ("POST", "/v1/responses")
+    assert set(body) == {"model", "instructions", "input", "text", "max_output_tokens",
+                         "store"}
+    assert body["model"] == "gpt-6-sol"
+    assert body["instructions"] == _INSTRUCTIONS
+    assert body["input"] == [{"role": "user", "content": json.dumps(
+        {"messages": project_analysis_input(_fixed_smoke_input()).remote_payload()},
+        ensure_ascii=False, separators=(",", ":"))}]
+    assert body["text"] == {"format": {"type": "json_schema",
+                                      "name": "commercial_analysis_v1", "strict": True,
+                                      "schema": response_schema()}}
+    assert body["max_output_tokens"] == 4096
+    assert body["store"] is False
 
 
 @pytest.mark.parametrize("error", [

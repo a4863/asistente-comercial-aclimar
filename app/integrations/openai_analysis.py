@@ -251,16 +251,20 @@ class OpenAIAnalysis:
                     _raise("timeout")
                 authorize()
                 try:
-                    response = client.responses.create(
-                        model=settings.model,
-                        instructions=_INSTRUCTIONS,
-                        input=request_input,
-                        text={"format": {"type": "json_schema", "name": "commercial_analysis_v1",
-                                         "strict": True, "schema": response_schema()}},
-                        max_output_tokens=settings.max_output_tokens,
-                        store=False,
-                        timeout=remaining,
-                    )
+                    request_kwargs = {
+                        "model": settings.model,
+                        "instructions": _INSTRUCTIONS,
+                        "input": request_input,
+                        "text": {"format": {"type": "json_schema", "name": "commercial_analysis_v1",
+                                            "strict": True, "schema": response_schema()}},
+                        "max_output_tokens": settings.max_output_tokens,
+                        "store": False,
+                        "timeout": remaining,
+                    }
+                except Exception:
+                    _raise("request_schema_failure")
+                try:
+                    response = client.responses.create(**request_kwargs)
                 except Exception as error:
                     status = (getattr(error, "status_code", None)
                               if isinstance(error, openai.APIStatusError) else None)

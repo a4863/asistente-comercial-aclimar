@@ -28,6 +28,7 @@ _DIAGNOSTIC_CODES = frozenset({
     "provider_unprocessable",
     "provider_client_error",
     "provider_non_http_failure",
+    "request_schema_failure",
 })
 
 
