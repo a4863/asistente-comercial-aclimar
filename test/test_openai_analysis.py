@@ -13,7 +13,10 @@ from types import SimpleNamespace
 
 import httpx2
 import httpcore2
+import idna
 import openai as installed_openai
+import pydantic
+import pydantic_core
 import pytest
 
 from app.config import AISettings
@@ -424,8 +427,16 @@ class UnrelatedError(Exception):
     (httpx2.DecodingError("synthetic-secret"), "provider_http_client_error_family"),
     (OSError("synthetic-secret"), "provider_os_error_family"),
     (ssl.SSLCertVerificationError("synthetic-secret"), "provider_os_error_family"),
-    (UnicodeError("synthetic-secret"), "provider_value_subclass_family"),
+    (UnicodeError("synthetic-secret"), "provider_unicode_error_family"),
     (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "synthetic-secret"),
+     "provider_unicode_error_family"),
+    (UnicodeEncodeError("utf-8", "\ud800", 0, 1, "synthetic-secret"),
+     "provider_unicode_error_family"),
+    (idna.IDNAError("synthetic-secret"), "provider_unicode_error_family"),
+    (pydantic.ValidationError.from_exception_data(
+        "Synthetic", [{"type": "missing", "loc": ("field",), "input": {}}]),
+     "provider_value_subclass_family"),
+    (pydantic_core.PydanticSerializationError("synthetic-secret"),
      "provider_value_subclass_family"),
     (CustomJSONDecodeError("synthetic-secret", "synthetic-document", 0),
      "provider_value_subclass_family"),
@@ -633,6 +644,16 @@ def test_pinned_sdk_malformed_json_is_bounded_without_network(monkeypatch):
             200, content=b"{synthetic-invalid", headers={"content-type": "application/json"}),
     )
     assert code == "provider_response_json_failure"
+    assert seen == [("POST", "/v1/responses")]
+
+
+def test_pinned_sdk_invalid_utf8_is_unicode_family_without_network(monkeypatch):
+    code, seen = _pinned_sdk_smoke_failure(
+        monkeypatch,
+        lambda _request: httpx2.Response(
+            200, content=b"\xff", headers={"content-type": "application/json"}),
+    )
+    assert code == "provider_unicode_error_family"
     assert seen == [("POST", "/v1/responses")]
 
 

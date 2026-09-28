@@ -317,6 +317,8 @@ class OpenAIAnalysis:
                         category, transient = "provider_http_client_error_family", False
                     elif isinstance(error, OSError):
                         category, transient = "provider_os_error_family", False
+                    elif isinstance(error, UnicodeError):
+                        category, transient = "provider_unicode_error_family", False
                     elif isinstance(error, ValueError):
                         category, transient = "provider_value_subclass_family", False
                     elif isinstance(error, (TypeError, RuntimeError, AttributeError,
