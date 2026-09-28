@@ -300,6 +300,16 @@ class OpenAIAnalysis:
                         category, transient = "provider_client_error", False
                     elif isinstance(error, openai.APIStatusError):
                         category, transient = "provider_failure", False
+                    elif type(error) is openai.APIResponseValidationError:
+                        category, transient = "provider_response_validation_failure", False
+                    elif type(error) is json.JSONDecodeError:
+                        category, transient = "provider_response_json_failure", False
+                    elif type(error) is TypeError:
+                        category, transient = "provider_sdk_type_failure", False
+                    elif type(error) is ValueError:
+                        category, transient = "provider_sdk_value_failure", False
+                    elif type(error) is RuntimeError:
+                        category, transient = "provider_sdk_runtime_failure", False
                     else:
                         category, transient = "provider_non_http_failure", False
                     if not transient or attempt >= settings.max_retries:

@@ -19,6 +19,9 @@ ALLOWED_DIAGNOSTICS = (
     "provider_bad_request", "provider_not_found", "provider_conflict",
     "provider_unprocessable", "provider_client_error", "provider_non_http_failure",
     "request_schema_failure",
+    "provider_response_validation_failure", "provider_response_json_failure",
+    "provider_sdk_type_failure", "provider_sdk_value_failure",
+    "provider_sdk_runtime_failure",
 )
 EXCLUDED_DIAGNOSTICS = (
     "operational_ownership_required", "commercial_activation_required", "busy",

@@ -29,6 +29,11 @@ _DIAGNOSTIC_CODES = frozenset({
     "provider_client_error",
     "provider_non_http_failure",
     "request_schema_failure",
+    "provider_response_validation_failure",
+    "provider_response_json_failure",
+    "provider_sdk_type_failure",
+    "provider_sdk_value_failure",
+    "provider_sdk_runtime_failure",
 })
 
 

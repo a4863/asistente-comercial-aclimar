@@ -59,12 +59,17 @@ class AuthenticationError(APIStatusError):
     pass
 
 
+class APIResponseValidationError(Exception):
+    pass
+
+
 @pytest.fixture(autouse=True)
 def fake_openai_module(monkeypatch):
     module = SimpleNamespace(OpenAI=lambda **kwargs: None,
                              APIConnectionError=APIConnectionError,
                              APITimeoutError=APITimeoutError,
                              APIStatusError=APIStatusError,
+                             APIResponseValidationError=APIResponseValidationError,
                              RateLimitError=RateLimitError,
                              AuthenticationError=AuthenticationError)
     monkeypatch.setitem(sys.modules, "openai", module)
@@ -345,20 +350,51 @@ def test_malformed_or_unclassifiable_typed_status_remains_generic(status):
     assert len(factory.responses.calls) == 1
 
 
-@pytest.mark.parametrize("error", [
-    TypeError("raw-provider-body\nsynthetic-secret-and-body"),
-    ValueError("https://private.example/secret"),
+@pytest.mark.parametrize("error, expected", [
+    (APIResponseValidationError("raw-provider-body\nsynthetic-secret-and-body"),
+     "provider_response_validation_failure"),
+    (json.JSONDecodeError("raw-provider-body\nsynthetic-secret-and-body",
+                          "https://private.example/secret", 0),
+     "provider_response_json_failure"),
+    (TypeError("raw-provider-body\nsynthetic-secret-and-body"),
+     "provider_sdk_type_failure"),
+    (ValueError("https://private.example/secret"), "provider_sdk_value_failure"),
+    (RuntimeError("raw-provider-body\nsynthetic-secret-and-body"),
+     "provider_sdk_runtime_failure"),
 ])
-def test_non_http_failures_remain_bounded_and_non_retryable(error, caplog):
+def test_exact_sdk_failures_are_bounded_and_non_retryable(error, expected, caplog, capsys):
     caplog.set_level(logging.DEBUG)
+    factory = FakeFactory([error])
+    sleeps = []
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory, sleep=sleeps.append).analyze(_input())
+    assert caught.value.code == expected
+    assert len(factory.responses.calls) == 1
+    assert sleeps == []
+    captured = capsys.readouterr()
+    bounded = str(caught.value) + repr(caught.value) + captured.out + captured.err + caplog.text
+    for forbidden in ("raw-provider-body", "synthetic-secret-and-body", "private.example",
+                      "\n"):
+        assert forbidden not in bounded
+    assert isinstance(_adapter(factory=FakeFactory()).analyze(_input()), AnalysisCandidates)
+
+
+@pytest.mark.parametrize("error", [
+    type("CustomValidationError", (APIResponseValidationError,), {})("synthetic-secret"),
+    type("CustomJSONDecodeError", (json.JSONDecodeError,), {})(
+        "synthetic-secret", "synthetic-document", 0),
+    type("CustomTypeError", (TypeError,), {})("synthetic-secret"),
+    type("CustomValueError", (ValueError,), {})("synthetic-secret"),
+    type("CustomRuntimeError", (RuntimeError,), {})("synthetic-secret"),
+    Exception("synthetic-secret"),
+])
+def test_unknown_non_http_subclasses_keep_generic_fallback(error):
     factory = FakeFactory([error])
     with pytest.raises(OpenAIAnalysisError) as caught:
         _adapter(factory=factory).analyze(_input())
     assert caught.value.code == "provider_non_http_failure"
     assert len(factory.responses.calls) == 1
-    for forbidden in ("raw-provider-body", "synthetic-secret-and-body", "private.example",
-                      "\n"):
-        assert forbidden not in str(caught.value) + repr(caught.value) + caplog.text
+    assert "synthetic-secret" not in str(caught.value)
 
 
 @pytest.mark.parametrize("forged_status", [400, 429, 503])
@@ -487,6 +523,95 @@ def test_fixed_smoke_request_serializes_with_pinned_sdk_and_no_network(monkeypat
                                       "schema": response_schema()}}
     assert body["max_output_tokens"] == 4096
     assert body["store"] is False
+
+
+def _pinned_sdk_smoke_failure(monkeypatch, responder, *, strict=False,
+                              http_client_type=httpx2.Client):
+    monkeypatch.setitem(sys.modules, "openai", installed_openai)
+    seen = []
+
+    def no_send(request):
+        seen.append((request.method, request.url.path))
+        return responder(request)
+
+    settings = AISettings(enabled=True, model="gpt-6-sol",
+                          base_url="https://api.openai.com/v1", max_output_tokens=4096)
+    with http_client_type(transport=httpx2.MockTransport(no_send),
+                          trust_env=False) as http_client:
+        def factory(**kwargs):
+            assert kwargs["api_key"] == "synthetic-offline-only"
+            assert kwargs["max_retries"] == 0
+            return installed_openai.OpenAI(
+                **kwargs, http_client=http_client,
+                _strict_response_validation=strict,
+            )
+
+        adapter = OpenAIAnalysis(settings, FakeCredentials("synthetic-offline-only"),
+                                 ownership=FakeOwnership(), client_factory=factory,
+                                 sleep=lambda _: None)
+        with pytest.raises(OpenAIAnalysisError) as caught:
+            adapter.smoke()
+    return caught.value.code, seen
+
+
+def test_pinned_sdk_malformed_json_is_bounded_without_network(monkeypatch):
+    code, seen = _pinned_sdk_smoke_failure(
+        monkeypatch,
+        lambda _request: httpx2.Response(
+            200, content=b"{synthetic-invalid", headers={"content-type": "application/json"}),
+    )
+    assert code == "provider_response_json_failure"
+    assert seen == [("POST", "/v1/responses")]
+
+
+def test_pinned_sdk_strict_validation_is_bounded_without_network(monkeypatch):
+    code, seen = _pinned_sdk_smoke_failure(
+        monkeypatch, lambda _request: httpx2.Response(200, json={}), strict=True,
+    )
+    assert code == "provider_response_validation_failure"
+    assert seen == [("POST", "/v1/responses")]
+
+
+def test_pinned_sdk_pre_send_type_failure_has_zero_dispatch(monkeypatch):
+    class BrokenBuildClient(httpx2.Client):
+        def build_request(self, *args, **kwargs):
+            raise TypeError("synthetic-secret-and-body")
+
+    code, seen = _pinned_sdk_smoke_failure(
+        monkeypatch, lambda _request: pytest.fail("mock transport reached"),
+        http_client_type=BrokenBuildClient,
+    )
+    assert code == "provider_sdk_type_failure"
+    assert seen == []
+
+
+@pytest.mark.parametrize("error, expected", [
+    (ValueError("synthetic-secret-and-body"), "provider_sdk_value_failure"),
+    (RuntimeError("synthetic-secret-and-body"), "provider_sdk_runtime_failure"),
+])
+def test_pinned_sdk_non_request_transport_exception_stays_bounded(
+        monkeypatch, error, expected):
+    def fail(_request):
+        raise error
+
+    code, seen = _pinned_sdk_smoke_failure(monkeypatch, fail)
+    assert code == expected
+    assert seen == [("POST", "/v1/responses")]
+
+
+@pytest.mark.parametrize("error_type, expected", [
+    (httpx2.ConnectError, "provider_transient_exhausted"),
+    (httpx2.ConnectTimeout, "timeout"),
+    (httpx2.ProxyError, "provider_transient_exhausted"),
+])
+def test_pinned_sdk_transport_errors_keep_existing_categories(
+        monkeypatch, error_type, expected):
+    def fail(request):
+        raise error_type("synthetic-secret-and-body", request=request)
+
+    code, seen = _pinned_sdk_smoke_failure(monkeypatch, fail)
+    assert code == expected
+    assert seen == [("POST", "/v1/responses")] * 2
 
 
 @pytest.mark.parametrize("error", [
