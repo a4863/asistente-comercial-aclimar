@@ -132,7 +132,7 @@ class _OfflineOpenAI:
 
     def __call__(self, **kwargs):
         self.factory_calls.append(kwargs)
-        return SimpleNamespace(responses=self)
+        return SimpleNamespace(responses=self, close=kwargs["http_client"].close)
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
@@ -152,6 +152,13 @@ class _OfflineOpenAI:
 
 @pytest.fixture
 def _fake_openai_module(monkeypatch):
+    class FakeHttpClient:
+        def __init__(self, **_kwargs):
+            self.close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
     class ConnectionError(Exception):
         pass
 
@@ -165,6 +172,7 @@ def _fake_openai_module(monkeypatch):
         pass
 
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(
+        DefaultHttpxClient=FakeHttpClient,
         APITimeoutError=TimeoutError, APIConnectionError=ConnectionError,
         RateLimitError=RateLimitError, AuthenticationError=AuthenticationError))
 
@@ -183,6 +191,7 @@ def test_concrete_openai_completes_replays_and_forces_new_run(analysis_db, _fake
                                      force_reanalysis=True)
     assert second.status == "completed" and second.run_id != first.run_id
     assert len(remote.calls) == len(remote.credentials) == 2
+    assert [call["http_client"].close_count for call in remote.factory_calls] == [1, 1]
     with analysis_db() as session:
         assert [run.run_version for run in session.scalars(
             select(AnalysisRun).order_by(AnalysisRun.run_version))] == [1, 2]
@@ -202,6 +211,7 @@ def test_concrete_openai_failure_is_bounded_and_retryable(
     result = analyze_email_in_thread(analysis_db, remote.adapter(), "imap:test", target_id)
     assert (result.status, result.failure_code) == ("failed_retryable", expected)
     assert len(remote.calls) == 1
+    assert remote.factory_calls[0]["http_client"].close_count == 1
     assert "synthetic-test-key-only" not in repr(result)
     assert "provider body" not in repr(result)
     assert "synthetic-test-key-only" not in caplog.text
@@ -213,6 +223,7 @@ def test_concrete_openai_failure_is_bounded_and_retryable(
     again = analyze_email_in_thread(analysis_db, retry.adapter(), "imap:test", target_id)
     assert again.status == "completed" and again.run_id != result.run_id
     assert len(retry.calls) == 1
+    assert retry.factory_calls[0]["http_client"].close_count == 1
 
 
 def test_concrete_openai_stale_source_and_provider_outside_write_transaction(

@@ -24,6 +24,8 @@ ALLOWED_DIAGNOSTICS = (
     "provider_sdk_runtime_failure",
     "provider_openai_error_family", "provider_http_client_error_family",
     "provider_os_error_family", "provider_unicode_error_family",
+    "provider_unicode_before_request_hook", "provider_unicode_request_hook_reached",
+    "provider_unicode_response_hook_reached", "provider_client_close_failure",
     "provider_value_subclass_family",
     "provider_python_internal_family", "provider_exception_group_family",
 )

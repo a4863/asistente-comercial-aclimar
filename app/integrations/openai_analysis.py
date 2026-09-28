@@ -71,6 +71,14 @@ def _raise(code: str) -> None:
     raise OpenAIAnalysisError(code) from None
 
 
+def _unicode_phase_code(phase: str | None) -> str:
+    return {
+        "before_request_hook": "provider_unicode_before_request_hook",
+        "request_hook_reached": "provider_unicode_request_hook_reached",
+        "response_hook_reached": "provider_unicode_response_hook_reached",
+    }.get(phase, "provider_unicode_error_family")
+
+
 def _provider_code(error: object) -> str | None:
     """Inspect typed provider error metadata without exposing its body."""
     code = getattr(error, "code", None)
@@ -228,6 +236,17 @@ class OpenAIAnalysis:
             _raise("invalid_input")
         if not _REQUEST_LOCK.acquire(blocking=False):
             _raise("busy")
+        phase = ["before_request_hook"]
+
+        def request_hook(_request: object) -> None:
+            if phase[0] == "before_request_hook":
+                phase[0] = "request_hook_reached"
+
+        def response_hook(_response: object) -> None:
+            phase[0] = "response_hook_reached"
+
+        client = None
+        completed = False
         try:
             try:
                 secret = self._credentials.get_secret(
@@ -240,8 +259,22 @@ class OpenAIAnalysis:
                 import openai
                 import httpx2
                 factory = self._client_factory or openai.OpenAI
-                client = factory(api_key=secret, base_url=settings.base_url,
-                                 max_retries=0, timeout=max(_MIN_ATTEMPT_SECONDS, deadline - self._clock()))
+                client_timeout = max(_MIN_ATTEMPT_SECONDS, deadline - self._clock())
+                http_client = openai.DefaultHttpxClient(
+                    base_url=settings.base_url,
+                    timeout=client_timeout,
+                    event_hooks={"request": [request_hook], "response": [response_hook]},
+                )
+                try:
+                    client = factory(api_key=secret, base_url=settings.base_url,
+                                     max_retries=0, timeout=client_timeout,
+                                     http_client=http_client)
+                except Exception:
+                    try:
+                        http_client.close()
+                    except Exception:
+                        pass
+                    raise
             except Exception:
                 _raise("provider_unavailable")
             finally:
@@ -264,6 +297,7 @@ class OpenAIAnalysis:
                     }
                 except Exception:
                     _raise("request_schema_failure")
+                phase[0] = "before_request_hook"
                 try:
                     response = client.responses.create(**request_kwargs)
                 except Exception as error:
@@ -318,7 +352,8 @@ class OpenAIAnalysis:
                     elif isinstance(error, OSError):
                         category, transient = "provider_os_error_family", False
                     elif isinstance(error, UnicodeError):
-                        category, transient = "provider_unicode_error_family", False
+                        category = _unicode_phase_code(phase[0])
+                        transient = False
                     elif isinstance(error, ValueError):
                         category, transient = "provider_value_subclass_family", False
                     elif isinstance(error, (TypeError, RuntimeError, AttributeError,
@@ -340,9 +375,19 @@ class OpenAIAnalysis:
                 text = _structured_text(response)
                 try:
                     parsed = json.loads(text)
-                    return decode_analysis_response(parsed, projection)
+                    result = decode_analysis_response(parsed, projection)
                 except (ValueError, AISchemaError, TypeError, OverflowError, UnicodeError):
                     _raise("invalid_output")
+                completed = True
+                return result
             _raise("provider_transient_exhausted")
         finally:
-            _REQUEST_LOCK.release()
+            try:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        if completed:
+                            _raise("provider_client_close_failure")
+            finally:
+                _REQUEST_LOCK.release()

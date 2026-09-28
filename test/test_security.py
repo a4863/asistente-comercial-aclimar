@@ -101,7 +101,7 @@ class _OfflineOpenAI:
 
     def __call__(self, **kwargs):
         self.factory_calls.append(kwargs)
-        return SimpleNamespace(responses=self)
+        return SimpleNamespace(responses=self, close=kwargs["http_client"].close)
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
@@ -120,6 +120,13 @@ class _OfflineOpenAI:
 
 @pytest.fixture
 def _fake_openai_module(monkeypatch):
+    class FakeHttpClient:
+        def __init__(self, **_kwargs):
+            self.close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
     class ConnectionError(Exception):
         pass
 
@@ -133,6 +140,7 @@ def _fake_openai_module(monkeypatch):
         pass
 
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(
+        DefaultHttpxClient=FakeHttpClient,
         APITimeoutError=TimeoutError, APIConnectionError=ConnectionError,
         RateLimitError=RateLimitError, AuthenticationError=AuthenticationError))
 
@@ -161,6 +169,7 @@ def test_concrete_openai_treats_injected_email_only_as_untrusted_data(
     assert not set(request) & {"tools", "tool_choice", "functions", "stream",
                                "web", "browser", "computer", "code_execution"}
     assert remote.factory_calls[0]["max_retries"] == 0
+    assert remote.factory_calls[0]["http_client"].close_count == 1
     assert remote.secret not in caplog.text
     assert remote.secret not in repr(result) and remote.secret not in repr(remote.adapter())
     _assert_no_external_authority(secure_db)

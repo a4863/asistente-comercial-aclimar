@@ -76,9 +76,26 @@ class APIResponseValidationError(APIError):
     pass
 
 
+class FakeHttpClient:
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.close_count = 0
+        self.close_error = None
+        self.instances.append(self)
+
+    def close(self):
+        self.close_count += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
 @pytest.fixture(autouse=True)
 def fake_openai_module(monkeypatch):
+    FakeHttpClient.instances = []
     module = SimpleNamespace(OpenAI=lambda **kwargs: None,
+                             DefaultHttpxClient=FakeHttpClient,
                              OpenAIError=OpenAIError,
                              APIError=APIError,
                              APIConnectionError=APIConnectionError,
@@ -144,10 +161,14 @@ class FakeFactory:
     def __init__(self, outcomes=None):
         self.responses = FakeResponses(outcomes)
         self.kwargs = []
+        self.clients = []
 
     def __call__(self, **kwargs):
         self.kwargs.append(kwargs)
-        return SimpleNamespace(responses=self.responses)
+        http_client = kwargs["http_client"]
+        client = SimpleNamespace(responses=self.responses, close=http_client.close)
+        self.clients.append(client)
+        return client
 
 
 def _adapter(*, settings=None, credentials=None, factory=None, **kwargs):
@@ -209,6 +230,7 @@ def test_revocation_during_retry_delay_prevents_second_attempt(revoke):
     assert caught.value.code == ("commercial_activation_required" if revoke == "gate"
                                  else "operational_ownership_required")
     assert len(factory.responses.calls) == 1
+    assert len(factory.clients) == FakeHttpClient.instances[0].close_count == 1
     assert "synthetic-secret-and-body" not in str(caught.value)
 
 
@@ -229,6 +251,7 @@ def test_revocation_after_client_creation_prevents_first_attempt():
         adapter.analyze(_input())
     assert len(factory.kwargs) == 1
     assert factory.responses.calls == []
+    assert FakeHttpClient.instances[0].close_count == 1
 
 
 @pytest.mark.parametrize("credentials, expected", [
@@ -259,6 +282,12 @@ def test_request_uses_responses_strict_schema_and_minimized_untrusted_input(capl
     assert factory.kwargs[0]["base_url"] == settings.base_url
     assert factory.kwargs[0]["api_key"] == credentials.secret
     assert factory.kwargs[0]["timeout"] <= 60
+    http_client = factory.kwargs[0]["http_client"]
+    assert http_client.kwargs["base_url"] == settings.base_url
+    assert http_client.kwargs["timeout"] == factory.kwargs[0]["timeout"]
+    assert set(http_client.kwargs) == {"base_url", "timeout", "event_hooks"}
+    assert set(http_client.kwargs["event_hooks"]) == {"request", "response"}
+    assert len(factory.clients) == http_client.close_count == 1
     call = factory.responses.calls[0]
     assert call["model"] == "gpt-6-sol"
     assert call["max_output_tokens"] == 900
@@ -300,6 +329,7 @@ def test_bad_response_fails_without_retry(response, code):
         _adapter(factory=factory).analyze(_input())
     assert caught.value.code == code
     assert len(factory.responses.calls) == 1
+    assert FakeHttpClient.instances[0].close_count == 1
     assert "synthetic refusal" not in str(caught.value)
 
 
@@ -327,6 +357,78 @@ def test_non_transient_errors_never_retry(error, code):
         _adapter(factory=factory).analyze(_input())
     assert caught.value.code == code
     assert len(factory.responses.calls) == 1
+    assert FakeHttpClient.instances[0].close_count == 1
+
+
+def test_client_reused_across_retry_and_closed_only_after_final_attempt():
+    factory = FakeFactory([APIConnectionError("synthetic"), _response()])
+    close_counts_at_sleep = []
+
+    def sleep(_delay):
+        close_counts_at_sleep.append(FakeHttpClient.instances[0].close_count)
+
+    assert isinstance(_adapter(factory=factory, sleep=sleep).analyze(_input()), AnalysisCandidates)
+    assert len(factory.clients) == len(factory.kwargs) == 1
+    assert len(factory.responses.calls) == 2
+    assert close_counts_at_sleep == [0]
+    assert FakeHttpClient.instances[0].close_count == 1
+
+
+def test_client_closed_once_after_transient_exhaustion():
+    factory = FakeFactory([APIConnectionError("first"), APIConnectionError("second")])
+    with pytest.raises(OpenAIAnalysisError, match="provider_transient_exhausted"):
+        _adapter(factory=factory, sleep=lambda _: None).analyze(_input())
+    assert len(factory.clients) == 1
+    assert len(factory.responses.calls) == 2
+    assert FakeHttpClient.instances[0].close_count == 1
+
+
+def test_successful_operation_with_close_failure_is_bounded_and_not_retried(capsys, caplog):
+    caplog.set_level(logging.DEBUG)
+    factory = FakeFactory()
+
+    def close_failing_factory(**kwargs):
+        kwargs["http_client"].close_error = RuntimeError("synthetic-secret-close")
+        return factory(**kwargs)
+
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=close_failing_factory).analyze(_input())
+    assert caught.value.code == "provider_client_close_failure"
+    assert len(factory.responses.calls) == 1
+    assert FakeHttpClient.instances[0].close_count == 1
+    captured = capsys.readouterr()
+    assert "synthetic-secret-close" not in captured.out + captured.err + caplog.text + str(caught.value)
+
+
+def test_primary_failure_survives_close_failure_without_retry(capsys, caplog):
+    caplog.set_level(logging.DEBUG)
+    factory = FakeFactory([APIStatusError(400)])
+
+    def close_failing_factory(**kwargs):
+        kwargs["http_client"].close_error = RuntimeError("synthetic-secret-close")
+        return factory(**kwargs)
+
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=close_failing_factory).analyze(_input())
+    assert caught.value.code == "provider_bad_request"
+    assert len(factory.responses.calls) == 1
+    assert FakeHttpClient.instances[0].close_count == 1
+    captured = capsys.readouterr()
+    assert "synthetic-secret-close" not in captured.out + captured.err + caplog.text + str(caught.value)
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_factory_failure_closes_only_http_client_and_preserves_bounded_code(cleanup_fails):
+    def failing_factory(**kwargs):
+        if cleanup_fails:
+            kwargs["http_client"].close_error = RuntimeError("synthetic-secret-close")
+        raise RuntimeError("synthetic-secret-factory")
+
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=failing_factory).analyze(_input())
+    assert caught.value.code == "provider_unavailable"
+    assert "synthetic-secret" not in str(caught.value)
+    assert FakeHttpClient.instances[0].close_count == 1
     assert "synthetic-secret-and-body" not in str(caught.value)
 
 
@@ -427,12 +529,12 @@ class UnrelatedError(Exception):
     (httpx2.DecodingError("synthetic-secret"), "provider_http_client_error_family"),
     (OSError("synthetic-secret"), "provider_os_error_family"),
     (ssl.SSLCertVerificationError("synthetic-secret"), "provider_os_error_family"),
-    (UnicodeError("synthetic-secret"), "provider_unicode_error_family"),
+    (UnicodeError("synthetic-secret"), "provider_unicode_before_request_hook"),
     (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "synthetic-secret"),
-     "provider_unicode_error_family"),
+     "provider_unicode_before_request_hook"),
     (UnicodeEncodeError("utf-8", "\ud800", 0, 1, "synthetic-secret"),
-     "provider_unicode_error_family"),
-    (idna.IDNAError("synthetic-secret"), "provider_unicode_error_family"),
+     "provider_unicode_before_request_hook"),
+    (idna.IDNAError("synthetic-secret"), "provider_unicode_before_request_hook"),
     (pydantic.ValidationError.from_exception_data(
         "Synthetic", [{"type": "missing", "loc": ("field",), "input": {}}]),
      "provider_value_subclass_family"),
@@ -466,6 +568,64 @@ def test_residual_sdk_error_families_are_bounded_and_non_retryable(
     bounded = str(caught.value) + repr(caught.value) + captured.out + captured.err + caplog.text
     assert "synthetic-secret" not in bounded
     assert isinstance(_adapter(factory=FakeFactory()).analyze(_input()), AnalysisCandidates)
+
+
+@pytest.mark.parametrize("events, expected", [
+    ((), "provider_unicode_before_request_hook"),
+    (("request",), "provider_unicode_request_hook_reached"),
+    (("request", "response", "request", "response"),
+     "provider_unicode_response_hook_reached"),
+])
+def test_unicode_hook_phases_are_monotonic_and_ignore_arguments(events, expected):
+    class Opaque:
+        def __getattribute__(self, _name):
+            raise AssertionError("hook accessed its argument")
+
+    factory = FakeFactory()
+
+    class HookResponses(FakeResponses):
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            hooks = factory.kwargs[0]["http_client"].kwargs["event_hooks"]
+            for event in events:
+                hooks[event][0](Opaque())
+            raise UnicodeError("synthetic-secret")
+
+    factory.responses = HookResponses()
+    sleeps = []
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory, sleep=sleeps.append).analyze(_input())
+    assert caught.value.code == expected
+    assert len(factory.responses.calls) == 1
+    assert sleeps == []
+    assert FakeHttpClient.instances[0].close_count == 1
+
+
+def test_unicode_phase_resets_before_second_adapter_attempt():
+    factory = FakeFactory()
+
+    class HookResponses(FakeResponses):
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            hooks = factory.kwargs[0]["http_client"].kwargs["event_hooks"]
+            if len(self.calls) == 1:
+                hooks["response"][0](object())
+                raise APIConnectionError("synthetic-secret")
+            raise UnicodeError("synthetic-secret")
+
+    factory.responses = HookResponses()
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory, sleep=lambda _: None).analyze(_input())
+    assert caught.value.code == "provider_unicode_before_request_hook"
+    assert len(factory.responses.calls) == 2
+    assert FakeHttpClient.instances[0].close_count == 1
+
+
+def test_unicode_phase_unknown_state_keeps_family_fallback():
+    from app.integrations.openai_analysis import _unicode_phase_code
+
+    assert _unicode_phase_code(None) == "provider_unicode_error_family"
+    assert _unicode_phase_code("unrecognized") == "provider_unicode_error_family"
 
 
 def test_raw_http_status_error_is_not_broadly_classified_as_request_error():
@@ -580,16 +740,21 @@ def test_fixed_smoke_request_serializes_with_pinned_sdk_and_no_network(monkeypat
     settings = AISettings(enabled=True, model="gpt-6-sol",
                           base_url="https://api.openai.com/v1", max_output_tokens=4096)
     credentials = FakeCredentials("synthetic-offline-only")
-    with httpx2.Client(transport=httpx2.MockTransport(no_send)) as http_client:
-        def factory(**kwargs):
-            assert kwargs["api_key"] == "synthetic-offline-only"
-            assert kwargs["max_retries"] == 0
-            return installed_openai.OpenAI(**kwargs, http_client=http_client)
+    def fake_http_client(**kwargs):
+        return httpx2.Client(**kwargs, transport=httpx2.MockTransport(no_send),
+                             trust_env=False)
 
-        adapter = OpenAIAnalysis(settings, credentials, ownership=FakeOwnership(),
-                                 client_factory=factory)
-        with pytest.raises(OpenAIAnalysisError) as caught:
-            adapter.smoke()
+    monkeypatch.setattr(installed_openai, "DefaultHttpxClient", fake_http_client)
+
+    def factory(**kwargs):
+        assert kwargs["api_key"] == "synthetic-offline-only"
+        assert kwargs["max_retries"] == 0
+        return installed_openai.OpenAI(**kwargs)
+
+    adapter = OpenAIAnalysis(settings, credentials, ownership=FakeOwnership(),
+                             client_factory=factory)
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        adapter.smoke()
     assert caught.value.code == "invalid_output"
     assert len(seen) == 1
     method, path, body = seen[0]
@@ -609,7 +774,8 @@ def test_fixed_smoke_request_serializes_with_pinned_sdk_and_no_network(monkeypat
 
 
 def _pinned_sdk_smoke_failure(monkeypatch, responder, *, strict=False,
-                              http_client_type=httpx2.Client):
+                              http_client_type=httpx2.Client,
+                              secret="synthetic-offline-only"):
     monkeypatch.setitem(sys.modules, "openai", installed_openai)
     seen = []
 
@@ -619,21 +785,24 @@ def _pinned_sdk_smoke_failure(monkeypatch, responder, *, strict=False,
 
     settings = AISettings(enabled=True, model="gpt-6-sol",
                           base_url="https://api.openai.com/v1", max_output_tokens=4096)
-    with http_client_type(transport=httpx2.MockTransport(no_send),
-                          trust_env=False) as http_client:
-        def factory(**kwargs):
-            assert kwargs["api_key"] == "synthetic-offline-only"
-            assert kwargs["max_retries"] == 0
-            return installed_openai.OpenAI(
-                **kwargs, http_client=http_client,
-                _strict_response_validation=strict,
-            )
+    def fake_http_client(**kwargs):
+        return http_client_type(**kwargs, transport=httpx2.MockTransport(no_send),
+                                trust_env=False)
 
-        adapter = OpenAIAnalysis(settings, FakeCredentials("synthetic-offline-only"),
-                                 ownership=FakeOwnership(), client_factory=factory,
-                                 sleep=lambda _: None)
-        with pytest.raises(OpenAIAnalysisError) as caught:
-            adapter.smoke()
+    monkeypatch.setattr(installed_openai, "DefaultHttpxClient", fake_http_client)
+
+    def factory(**kwargs):
+        assert kwargs["api_key"] == secret
+        assert kwargs["max_retries"] == 0
+        return installed_openai.OpenAI(
+            **kwargs, _strict_response_validation=strict,
+        )
+
+    adapter = OpenAIAnalysis(settings, FakeCredentials(secret),
+                             ownership=FakeOwnership(), client_factory=factory,
+                             sleep=lambda _: None)
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        adapter.smoke()
     return caught.value.code, seen
 
 
@@ -647,13 +816,37 @@ def test_pinned_sdk_malformed_json_is_bounded_without_network(monkeypatch):
     assert seen == [("POST", "/v1/responses")]
 
 
-def test_pinned_sdk_invalid_utf8_is_unicode_family_without_network(monkeypatch):
+@pytest.mark.parametrize("payload", [
+    b"\xff",
+    bytes.fromhex("fffe7b00ff"),
+    bytes.fromhex("fffe00007b0000"),
+])
+def test_pinned_sdk_invalid_unicode_is_response_phase_without_network(monkeypatch, payload):
     code, seen = _pinned_sdk_smoke_failure(
         monkeypatch,
         lambda _request: httpx2.Response(
-            200, content=b"\xff", headers={"content-type": "application/json"}),
+            200, content=payload, headers={"content-type": "application/json"}),
     )
-    assert code == "provider_unicode_error_family"
+    assert code == "provider_unicode_response_hook_reached"
+    assert seen == [("POST", "/v1/responses")]
+
+
+def test_pinned_sdk_pre_hook_unicode_uses_bounded_phase_without_network(monkeypatch):
+    code, seen = _pinned_sdk_smoke_failure(
+        monkeypatch,
+        lambda _request: pytest.fail("mock transport reached"),
+        secret="synthetic-\u2603",
+    )
+    assert code == "provider_unicode_before_request_hook"
+    assert seen == []
+
+
+def test_pinned_sdk_request_hook_without_response_is_bounded(monkeypatch):
+    def fail(_request):
+        raise UnicodeError("synthetic-secret")
+
+    code, seen = _pinned_sdk_smoke_failure(monkeypatch, fail)
+    assert code == "provider_unicode_request_hook_reached"
     assert seen == [("POST", "/v1/responses")]
 
 
