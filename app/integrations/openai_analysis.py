@@ -262,13 +262,16 @@ class OpenAIAnalysis:
                         timeout=remaining,
                     )
                 except Exception as error:
-                    status = getattr(error, "status_code", None)
-                    code = _provider_code(error)
+                    status = (getattr(error, "status_code", None)
+                              if isinstance(error, openai.APIStatusError) else None)
+                    if type(status) is not int:
+                        status = None
                     if isinstance(error, openai.APITimeoutError):
                         category, transient = "timeout", True
                     elif isinstance(error, openai.APIConnectionError):
                         category, transient = "provider_transient_exhausted", True
                     elif isinstance(error, openai.RateLimitError) or status == 429:
+                        code = _provider_code(error)
                         if code in _QUOTA_CODES:
                             category, transient = "provider_quota", False
                         elif code in _RATE_CODES:
@@ -281,8 +284,20 @@ class OpenAIAnalysis:
                         category, transient = "provider_quota", False
                     elif type(status) is int and 500 <= status <= 599:
                         category, transient = "provider_transient_exhausted", True
-                    else:
+                    elif status == 400:
+                        category, transient = "provider_bad_request", False
+                    elif status == 404:
+                        category, transient = "provider_not_found", False
+                    elif status == 409:
+                        category, transient = "provider_conflict", False
+                    elif status == 422:
+                        category, transient = "provider_unprocessable", False
+                    elif status is not None and 400 <= status <= 499:
+                        category, transient = "provider_client_error", False
+                    elif isinstance(error, openai.APIStatusError):
                         category, transient = "provider_failure", False
+                    else:
+                        category, transient = "provider_non_http_failure", False
                     if not transient or attempt >= settings.max_retries:
                         _raise(category)
                     delay = _retry_delay(error, self._wall_clock)

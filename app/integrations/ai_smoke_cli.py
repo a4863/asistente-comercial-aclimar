@@ -22,6 +22,12 @@ _DIAGNOSTIC_CODES = frozenset({
     "provider_refusal",
     "invalid_output",
     "invalid_configuration",
+    "provider_bad_request",
+    "provider_not_found",
+    "provider_conflict",
+    "provider_unprocessable",
+    "provider_client_error",
+    "provider_non_http_failure",
 })
 
 

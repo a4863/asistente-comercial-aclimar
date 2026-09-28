@@ -59,6 +59,7 @@ def fake_openai_module(monkeypatch):
     module = SimpleNamespace(OpenAI=lambda **kwargs: None,
                              APIConnectionError=APIConnectionError,
                              APITimeoutError=APITimeoutError,
+                             APIStatusError=APIStatusError,
                              RateLimitError=RateLimitError,
                              AuthenticationError=AuthenticationError)
     monkeypatch.setitem(sys.modules, "openai", module)
@@ -287,7 +288,7 @@ def test_non_json_and_oversize_output_fail_closed():
     (APIStatusError(402), "provider_quota"),
     (RateLimitError(429, "insufficient_quota"), "provider_quota"),
     (RateLimitError(429, "billing_hard_limit_reached"), "provider_quota"),
-    (APIStatusError(400), "provider_failure"),
+    (APIStatusError(400), "provider_bad_request"),
 ])
 def test_non_transient_errors_never_retry(error, code):
     factory = FakeFactory([error])
@@ -296,6 +297,85 @@ def test_non_transient_errors_never_retry(error, code):
     assert caught.value.code == code
     assert len(factory.responses.calls) == 1
     assert "synthetic-secret-and-body" not in str(caught.value)
+
+
+@pytest.mark.parametrize("status, expected", [
+    (400, "provider_bad_request"),
+    (404, "provider_not_found"),
+    (409, "provider_conflict"),
+    (422, "provider_unprocessable"),
+    (405, "provider_client_error"),
+    (408, "provider_client_error"),
+    (410, "provider_client_error"),
+    (413, "provider_client_error"),
+])
+def test_typed_client_statuses_have_bounded_non_retryable_categories(
+        status, expected, caplog):
+    caplog.set_level(logging.DEBUG)
+    error = APIStatusError(status, code="raw-provider-code\nsynthetic-secret-and-body")
+    error.body = {"error": {"message": "raw-provider-body\nsynthetic-secret-and-body"}}
+    error.url = "https://private.example/secret"
+    factory = FakeFactory([error])
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory).analyze(_input())
+    assert caught.value.code == expected
+    assert len(factory.responses.calls) == 1
+    for forbidden in ("raw-provider-code", "raw-provider-body", "synthetic-secret-and-body",
+                      "private.example", "\n"):
+        assert forbidden not in str(caught.value) + repr(caught.value) + caplog.text
+
+
+@pytest.mark.parametrize("status", [True, "400", None, -1, 302, 600])
+def test_malformed_or_unclassifiable_typed_status_remains_generic(status):
+    factory = FakeFactory([APIStatusError(status)])
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory).analyze(_input())
+    assert caught.value.code == "provider_failure"
+    assert len(factory.responses.calls) == 1
+
+
+@pytest.mark.parametrize("error", [
+    TypeError("raw-provider-body\nsynthetic-secret-and-body"),
+    ValueError("https://private.example/secret"),
+])
+def test_non_http_failures_remain_bounded_and_non_retryable(error, caplog):
+    caplog.set_level(logging.DEBUG)
+    factory = FakeFactory([error])
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory).analyze(_input())
+    assert caught.value.code == "provider_non_http_failure"
+    assert len(factory.responses.calls) == 1
+    for forbidden in ("raw-provider-body", "synthetic-secret-and-body", "private.example",
+                      "\n"):
+        assert forbidden not in str(caught.value) + repr(caught.value) + caplog.text
+
+
+@pytest.mark.parametrize("forged_status", [400, 429, 503])
+def test_non_http_exception_cannot_forge_status_classification(forged_status):
+    class ForgedStatusError(Exception):
+        status_code = forged_status
+
+    factory = FakeFactory([ForgedStatusError("raw-provider-body")])
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory).analyze(_input())
+    assert caught.value.code == "provider_non_http_failure"
+    assert len(factory.responses.calls) == 1
+    assert "raw-provider-body" not in str(caught.value)
+
+
+def test_local_schema_construction_failure_is_non_http(monkeypatch):
+    import app.integrations.openai_analysis as adapter_module
+
+    def broken_schema():
+        raise TypeError("raw-provider-body\nsynthetic-secret-and-body")
+
+    monkeypatch.setattr(adapter_module, "response_schema", broken_schema)
+    factory = FakeFactory()
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory).analyze(_input())
+    assert caught.value.code == "provider_non_http_failure"
+    assert factory.responses.calls == []
+    assert "raw-provider-body" not in str(caught.value)
 
 
 @pytest.mark.parametrize("error", [
