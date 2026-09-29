@@ -338,10 +338,10 @@ def test_request_uses_responses_strict_schema_and_minimized_untrusted_input(capl
 
 @pytest.mark.parametrize("response, code", [
     (_response(status="incomplete"), "provider_incomplete"),
-    (_response(status="failed"), "invalid_output"),
+    (_response(status="failed"), "provider_output_envelope_failure"),
     (_response(part_type="refusal"), "provider_refusal"),
-    (_response(part_type="tool_call"), "invalid_output"),
-    (_response({"schema_version": 1}), "invalid_output"),
+    (_response(part_type="tool_call"), "provider_output_envelope_failure"),
+    (_response({"schema_version": 1}), "provider_output_semantic_failure"),
 ])
 def test_bad_response_fails_without_retry(response, code):
     factory = FakeFactory([response])
@@ -386,28 +386,43 @@ def test_sdk_structured_text_shapes_decode_without_network(shape):
 
 
 @pytest.mark.parametrize("case, expected", [
-    ("empty_output", "invalid_output"),
-    ("empty_content", "invalid_output"),
-    ("empty_fragments", "invalid_output"),
-    ("non_string_fragment", "invalid_output"),
-    ("unknown_part", "invalid_output"),
-    ("tool_item", "invalid_output"),
-    ("wrong_role", "invalid_output"),
-    ("malformed_aggregate", "invalid_output"),
-    ("two_documents", "invalid_output"),
-    ("oversize_aggregate", "invalid_output"),
-    ("unicode_aggregate", "invalid_output"),
-    ("semantic_evidence", "invalid_output"),
+    ("missing_output", "provider_output_envelope_failure"),
+    ("non_list_output", "provider_output_envelope_failure"),
+    ("empty_output", "provider_output_envelope_failure"),
+    ("wrong_item_type", "provider_output_envelope_failure"),
+    ("non_list_content", "provider_output_envelope_failure"),
+    ("empty_content", "provider_output_envelope_failure"),
+    ("empty_fragments", "provider_output_envelope_failure"),
+    ("non_string_fragment", "provider_output_envelope_failure"),
+    ("unknown_part", "provider_output_envelope_failure"),
+    ("tool_item", "provider_output_envelope_failure"),
+    ("wrong_role", "provider_output_envelope_failure"),
+    ("malformed_aggregate", "provider_output_json_failure"),
+    ("two_documents", "provider_output_json_failure"),
+    ("oversize_aggregate", "provider_output_envelope_failure"),
+    ("unicode_aggregate", "provider_output_envelope_failure"),
+    ("semantic_evidence", "provider_output_semantic_failure"),
+    ("semantic_wrong_root", "provider_output_semantic_failure"),
+    ("semantic_bad_support", "provider_output_semantic_failure"),
+    ("semantic_bad_date", "provider_output_semantic_failure"),
     ("refusal_alone", "provider_refusal"),
     ("refusal_with_text", "provider_refusal"),
     ("incomplete", "provider_incomplete"),
-    ("failed", "invalid_output"),
+    ("failed", "provider_output_envelope_failure"),
 ])
 def test_split_output_fail_closed_and_releases_resources(case, expected):
     response = _response()
     content = response.output[0].content
-    if case == "empty_output":
+    if case == "missing_output":
+        del response.output
+    elif case == "non_list_output":
+        response.output = ()
+    elif case == "empty_output":
         response.output = []
+    elif case == "wrong_item_type":
+        response.output[0].type = "function_call"
+    elif case == "non_list_content":
+        response.output[0].content = ()
     elif case == "empty_content":
         response.output[0].content = []
     elif case == "empty_fragments":
@@ -438,6 +453,18 @@ def test_split_output_fail_closed_and_releases_resources(case, expected):
                              "evidence": {"message_alias": "m0", "start_offset": 0,
                                           "end_offset": 1, "exact_text": "X"}}]
         content[0].text = json.dumps(payload)
+    elif case == "semantic_wrong_root":
+        content[0].text = json.dumps([_empty()])
+    elif case == "semantic_bad_support":
+        payload = _empty()
+        payload["tasks"] = [{"title": "Review", "due_at": None,
+                             "support_refs": [{"kind": "fact", "index": 9}]}]
+        content[0].text = json.dumps(payload)
+    elif case == "semantic_bad_date":
+        payload = _empty()
+        payload["tasks"] = [{"title": "Review", "due_at": "yesterday",
+                             "support_refs": []}]
+        content[0].text = json.dumps(payload)
     elif case == "refusal_alone":
         content[0].type = "refusal"
     elif case == "refusal_with_text":
@@ -455,27 +482,42 @@ def test_split_output_fail_closed_and_releases_resources(case, expected):
     assert isinstance(_adapter().analyze(_input()), AnalysisCandidates)
 
 
-def test_split_output_failure_does_not_log_or_expose_raw_text(caplog, capsys):
+@pytest.mark.parametrize("stage, code", [
+    ("envelope", "provider_output_envelope_failure"),
+    ("json", "provider_output_json_failure"),
+    ("semantic", "provider_output_semantic_failure"),
+])
+def test_split_output_failure_does_not_log_or_expose_raw_text(caplog, capsys, stage, code):
     marker = "synthetic-sensitive-output-marker"
     response = _response()
-    response.output[0].content[0].text = "{bad-json-" + marker
-    response.output[0].content.append(SimpleNamespace(type="output_text", text="}"))
+    if stage == "envelope":
+        response.output[0].content.append(SimpleNamespace(type=marker, text="synthetic"))
+    elif stage == "json":
+        response.output[0].content[0].text = "{bad-json-" + marker
+        response.output[0].content.append(SimpleNamespace(type="output_text", text="}"))
+    else:
+        payload = _empty()
+        payload["facts"] = [{"fact_type": marker, "value_reference": "synthetic",
+                             "evidence": {"message_alias": "m0", "start_offset": 0,
+                                          "end_offset": 1, "exact_text": "X"}}]
+        response.output[0].content[0].text = json.dumps(payload)
     factory = FakeFactory([response])
     caplog.set_level(logging.DEBUG)
     with pytest.raises(OpenAIAnalysisError) as caught:
         _adapter(factory=factory).analyze(_input())
     captured = capsys.readouterr()
-    assert caught.value.code == "invalid_output"
+    assert caught.value.code == code
     assert marker not in str(caught.value) + caplog.text + captured.out + captured.err
     assert len(factory.responses.calls) == FakeHttpClient.instances[0].close_count == 1
 
 
 def test_non_json_and_oversize_output_fail_closed():
-    for text in ("{bad json", "x" * 160_001):
+    for text, code in (("{bad json", "provider_output_json_failure"),
+                       ("x" * 160_001, "provider_output_envelope_failure")):
         response = _response()
         response.output[0].content[0].text = text
         factory = FakeFactory([response])
-        with pytest.raises(OpenAIAnalysisError, match="invalid_output"):
+        with pytest.raises(OpenAIAnalysisError, match=code):
             _adapter(factory=factory).analyze(_input())
         assert len(factory.responses.calls) == 1
 
@@ -892,7 +934,7 @@ def test_fixed_smoke_request_serializes_with_pinned_sdk_and_no_network(monkeypat
                              client_factory=factory)
     with pytest.raises(OpenAIAnalysisError) as caught:
         adapter.smoke()
-    assert caught.value.code == "invalid_output"
+    assert caught.value.code == "provider_output_envelope_failure"
     assert len(seen) == 1
     method, path, body = seen[0]
     assert (method, path) == ("POST", "/v1/responses")

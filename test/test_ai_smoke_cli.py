@@ -16,6 +16,8 @@ ALLOWED_DIAGNOSTICS = (
     "provider_auth", "provider_quota", "provider_transient_exhausted",
     "provider_failure", "timeout", "provider_incomplete", "provider_refusal",
     "invalid_output", "invalid_configuration",
+    "provider_output_envelope_failure", "provider_output_json_failure",
+    "provider_output_semantic_failure",
     "provider_bad_request", "provider_not_found", "provider_conflict",
     "provider_unprocessable", "provider_client_error", "provider_non_http_failure",
     "request_schema_failure",

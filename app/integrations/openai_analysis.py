@@ -121,38 +121,38 @@ def _structured_text(response: object) -> str:
     if status == "incomplete":
         _raise("provider_incomplete")
     if status != "completed":
-        _raise("invalid_output")
+        _raise("provider_output_envelope_failure")
     output = getattr(response, "output", None)
     if not isinstance(output, list):
-        _raise("invalid_output")
+        _raise("provider_output_envelope_failure")
     texts: list[str] = []
     for item in output:
         kind = getattr(item, "type", None)
         if kind == "reasoning":
             continue
         if kind != "message" or getattr(item, "role", None) != "assistant":
-            _raise("invalid_output")
+            _raise("provider_output_envelope_failure")
         content = getattr(item, "content", None)
         if not isinstance(content, list):
-            _raise("invalid_output")
+            _raise("provider_output_envelope_failure")
         for part in content:
             part_kind = getattr(part, "type", None)
             if part_kind == "refusal":
                 _raise("provider_refusal")
             if part_kind != "output_text" or not isinstance(getattr(part, "text", None), str):
-                _raise("invalid_output")
+                _raise("provider_output_envelope_failure")
             texts.append(part.text)
     if not texts:
-        _raise("invalid_output")
+        _raise("provider_output_envelope_failure")
     text = "".join(texts)
     if not text:
-        _raise("invalid_output")
+        _raise("provider_output_envelope_failure")
     try:
         size = len(text.encode("utf-8"))
     except UnicodeError:
-        _raise("invalid_output")
+        _raise("provider_output_envelope_failure")
     if size > MAX_RESPONSE_BYTES:
-        _raise("invalid_output")
+        _raise("provider_output_envelope_failure")
     return text
 
 
@@ -378,9 +378,12 @@ class OpenAIAnalysis:
                 text = _structured_text(response)
                 try:
                     parsed = json.loads(text)
+                except (ValueError, AISchemaError, TypeError, OverflowError, UnicodeError):
+                    _raise("provider_output_json_failure")
+                try:
                     result = decode_analysis_response(parsed, projection)
                 except (ValueError, AISchemaError, TypeError, OverflowError, UnicodeError):
-                    _raise("invalid_output")
+                    _raise("provider_output_semantic_failure")
                 completed = True
                 return result
             _raise("provider_transient_exhausted")
