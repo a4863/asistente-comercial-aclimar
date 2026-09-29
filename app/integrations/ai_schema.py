@@ -181,14 +181,15 @@ def response_schema() -> dict:
     integer = {"type": "integer", "minimum": 0}
     evidence = _obj({"message_alias": _string(2), "start_offset": integer,
                      "end_offset": integer, "exact_text": _string()})
-    support = _obj({"kind": {"type": "string", "enum": ["fact", "inference", "proposal"]},
-                    "index": integer})
-    refs = _list(support)
+    def refs(*kinds: str) -> dict:
+        return _list(_obj({"kind": {"type": "string", "enum": list(kinds)},
+                           "index": {"type": "integer", "minimum": 0}}))
+
     fact = _obj({"fact_type": _string(100), "value_reference": _string(255), "evidence": evidence})
     inference = _obj({"inference_type": _string(100), "value_reference": _string(255),
-                      "support_refs": refs, "evidence": _nullable(evidence)})
+                      "support_refs": refs("fact"), "evidence": _nullable(evidence)})
     proposal = _obj({"proposal_type": _string(100), "value_reference": _string(255),
-                     "support_refs": refs, "evidence": _nullable(evidence)})
+                     "support_refs": refs("fact", "inference"), "evidence": _nullable(evidence)})
     question = _obj({"question_text": _string(), "evidence": evidence})
     date = _string(40, nullable=True)
     commitment = _obj({"description": _string(255),
@@ -196,10 +197,15 @@ def response_schema() -> dict:
                        "date_certainty": {"type": "string", "enum": ["exact", "resolved_relative", "uncertain", "none"]},
                        "date_expression": _string(255, nullable=True), "resolved_due_at": date,
                        "evidence": evidence, "explicit_promise": {"type": "boolean"}})
-    task = _obj({"title": _string(255), "due_at": date, "support_refs": refs})
-    next_step = _obj({"description": _string(255), "target_at": date, "support_refs": refs})
-    signal = _obj({"value": _string(20), "support_refs": refs,
-                   "evidence": _nullable(evidence)})
+    task = _obj({"title": _string(255), "due_at": date,
+                 "support_refs": refs("fact", "inference", "proposal")})
+    next_step = _obj({"description": _string(255), "target_at": date,
+                      "support_refs": refs("fact", "inference", "proposal")})
+
+    def signal(values: tuple[str, ...]) -> dict:
+        return _obj({"value": {"type": "string", "maxLength": 20, "enum": list(values)},
+                     "support_refs": refs("fact"), "evidence": _nullable(evidence)})
+
     mention = _obj({"kind": {"type": "string", "enum": ["company", "contact", "work", "opportunity", "offer"]},
                     "text": _string(), "evidence": evidence})
     return _obj({"schema_version": {"type": "integer", "enum": [SCHEMA_VERSION]},
@@ -207,8 +213,10 @@ def response_schema() -> dict:
                  "inferences": _list(inference), "proposals": _list(proposal),
                  "questions": _list(question), "commitments": _list(commitment),
                  "tasks": _list(task), "next_steps": _list(next_step),
-                 "response_needed": _nullable(signal), "commercial_risk": _nullable(signal),
-                 "priority": _nullable(signal), "context_mentions": _list(mention)})
+                 "response_needed": _nullable(signal(("yes", "no", "uncertain"))),
+                 "commercial_risk": _nullable(signal(("none", "low", "medium", "high", "unknown"))),
+                 "priority": _nullable(signal(("low", "normal", "high", "urgent"))),
+                 "context_mentions": _list(mention)})
 
 
 def decode_analysis_response(value: Any, projection: RemoteProjection) -> AnalysisCandidates:

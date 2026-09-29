@@ -102,6 +102,71 @@ def test_schema_strict_recursively_and_no_action_capability():
     visit(schema)
 
 
+def test_schema_enums_match_existing_domain_rules_without_new_keywords():
+    schema = response_schema()
+    properties = schema["properties"]
+
+    def support_kinds(field):
+        item = properties[field]["items"] if field in ("inferences", "proposals", "tasks", "next_steps") else properties[field]["anyOf"][0]
+        return item["properties"]["support_refs"]["items"]["properties"]["kind"]["enum"]
+
+    assert support_kinds("inferences") == ["fact"]
+    assert support_kinds("proposals") == ["fact", "inference"]
+    assert support_kinds("tasks") == support_kinds("next_steps") == ["fact", "inference", "proposal"]
+    for field, values in (
+        ("response_needed", ["yes", "no", "uncertain"]),
+        ("commercial_risk", ["none", "low", "medium", "high", "unknown"]),
+        ("priority", ["low", "normal", "high", "urgent"]),
+    ):
+        assert support_kinds(field) == ["fact"]
+        nullable = properties[field]["anyOf"]
+        assert nullable[1] == {"type": "null"}
+        assert nullable[0]["properties"]["value"] == {
+            "type": "string", "maxLength": 20, "enum": values,
+        }
+    assert properties["schema_version"] == {"type": "integer", "enum": [1]}
+    assert properties["facts"]["maxItems"] == 50
+    assert properties["facts"]["items"]["properties"]["fact_type"]["maxLength"] == 100
+    assert properties["tasks"]["items"]["properties"]["support_refs"]["items"]["properties"]["index"] == {
+        "type": "integer", "minimum": 0,
+    }
+
+    allowed = {"type", "maxLength", "maxItems", "minimum", "enum", "anyOf", "items",
+               "properties", "required", "additionalProperties"}
+
+    def check_keywords(node):
+        assert set(node) <= allowed
+        for key, value in node.items():
+            if key == "properties":
+                for child in value.values():
+                    check_keywords(child)
+            elif key == "items":
+                check_keywords(value)
+            elif key == "anyOf":
+                for child in value:
+                    check_keywords(child)
+
+    check_keywords(schema)
+
+
+def test_schema_support_fragments_are_independent():
+    properties = response_schema()["properties"]
+
+    def kinds(field):
+        item = properties[field]["items"] if field in ("inferences", "proposals", "tasks", "next_steps") else properties[field]["anyOf"][0]
+        return item["properties"]["support_refs"]["items"]["properties"]["kind"]["enum"]
+
+    kinds("inferences").append("proposal")
+    assert kinds("proposals") == ["fact", "inference"]
+    assert kinds("tasks") == kinds("next_steps") == ["fact", "inference", "proposal"]
+    kinds("response_needed").append("proposal")
+    assert kinds("commercial_risk") == kinds("priority") == ["fact"]
+    inference_ref = properties["inferences"]["items"]["properties"]["support_refs"]["items"]
+    task_ref = properties["tasks"]["items"]["properties"]["support_refs"]["items"]
+    inference_ref["properties"]["index"]["minimum"] = 1
+    assert task_ref["properties"]["index"]["minimum"] == 0
+
+
 def test_full_candidate_graph_and_local_evidence_mapping():
     projection = project_analysis_input(_input())
     raw = _empty()
@@ -135,6 +200,16 @@ def test_full_candidate_graph_and_local_evidence_mapping():
     assert len(result.tasks) == len(result.next_steps) == 1
 
 
+def test_minimal_and_evidence_backed_fact_remain_valid():
+    projection = project_analysis_input(_input())
+    assert decode_analysis_response(_empty(), projection).facts == ()
+    raw = _empty()
+    raw["facts"] = [{"fact_type": "request", "value_reference": "quote",
+                     "evidence": _evidence()}]
+    result = decode_analysis_response(raw, projection)
+    assert result.facts[0].evidence.exact_text == "Need a quote?"
+
+
 @pytest.mark.parametrize("change", [
     lambda r: r.update(extra="no"),
     lambda r: r.update(schema_version=True),
@@ -149,6 +224,14 @@ def test_full_candidate_graph_and_local_evidence_mapping():
     lambda r: r.update(facts=[{"fact_type": "x" * 101, "value_reference": "y", "evidence": _evidence()}]),
     lambda r: r.update(facts=[{"fact_type": "x", "value_reference": "y", "evidence": {**_evidence(), "extra": 1}}]),
     lambda r: r.update(response_needed={"value": "maybe", "support_refs": [], "evidence": _evidence()}),
+    lambda r: r.update(commitments=[{"description": "Send offer", "responsible_party": "unknown",
+                                      "date_certainty": "exact", "date_expression": None,
+                                      "resolved_due_at": None, "evidence": _evidence(),
+                                      "explicit_promise": False}]),
+    lambda r: r.update(facts=[{"fact_type": "request", "value_reference": "quote",
+                               "evidence": _evidence()}],
+                       tasks=[{"title": "Follow up", "due_at": "2026-09-29T12:00:00",
+                               "support_refs": [{"kind": "fact", "index": 0}]}]),
     lambda r: r.update(facts=[{}] * 51),
 ])
 def test_invalid_outputs_fail_closed(change):
