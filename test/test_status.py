@@ -219,6 +219,103 @@ def _action_headers(page, *, origin="http://127.0.0.1:8000"):
     return {"Origin": origin, "X-CSRF-Token": token.group(1)}
 
 
+def _gate_web(monkeypatch):
+    app = create_app(Settings())
+    app.state.operational_ready = True
+    app.state.operational_lock = SimpleNamespace(is_owner=True)
+    app.state.credential_store = SimpleNamespace(credential_presence=lambda *_args: "missing")
+    factory = SimpleNamespace(kw={"bind": SimpleNamespace(dispose=lambda: None)})
+    monkeypatch.setattr("app.web.routes.make_session_factory", lambda *_args: factory)
+    monkeypatch.setattr("app.web.routes.list_manual_analysis_options", lambda *_args: ())
+    return app
+
+
+def test_commercial_gate_ui_enable_disable_is_protected_idempotent_and_bodyless(
+        monkeypatch):
+    app = _gate_web(monkeypatch)
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        page = client.get("/")
+        assert 'data-path="/commercial-activation/enable"' in page.text
+        assert 'data-path="/commercial-activation/disable"' not in page.text
+        assert "Global processing is selected" in page.text
+        assert "resets OFF on every restart" in page.text
+        assert "EU residency" not in page.text and "ZDR" not in page.text
+        assert 'data-source-id=' not in page.text
+        assert "window.location.reload()" in page.text
+        headers = _action_headers(page)
+
+        def forbidden(*_args, **_kwargs):
+            pytest.fail("gate POST reached provider, credential or database")
+
+        with monkeypatch.context() as protected:
+            protected.setattr("app.web.routes.make_session_factory", forbidden)
+            protected.setattr("app.web.routes.OpenAIAnalysis", forbidden)
+            app.state.credential_store = SimpleNamespace(credential_presence=forbidden,
+                                                         get_secret=forbidden)
+            for _ in range(2):
+                response = client.post("/commercial-activation/enable", headers=headers)
+                assert response.status_code == 200
+                assert response.json() == {"status": "authorized"}
+                assert response.headers["cache-control"] == "no-store"
+                assert response.headers["referrer-policy"] == "no-referrer"
+                assert app.state.commercial_gate.is_enabled is True
+        app.state.credential_store = SimpleNamespace(credential_presence=lambda *_args: "missing")
+        page = client.get("/")
+        assert 'data-path="/commercial-activation/disable"' in page.text
+        assert 'data-path="/commercial-activation/enable"' not in page.text
+        assert "cannot recall an already-sent request" in page.text
+
+        with monkeypatch.context() as protected:
+            protected.setattr("app.web.routes.make_session_factory", forbidden)
+            protected.setattr("app.web.routes.OpenAIAnalysis", forbidden)
+            app.state.credential_store = SimpleNamespace(credential_presence=forbidden,
+                                                         get_secret=forbidden)
+            for _ in range(2):
+                response = client.post("/commercial-activation/disable", headers=headers)
+                assert response.status_code == 200
+                assert response.json() == {"status": "blocked"}
+                assert app.state.commercial_gate.is_enabled is False
+        app.state.credential_store = SimpleNamespace(credential_presence=lambda *_args: "missing")
+        assert 'data-path="/commercial-activation/enable"' in client.get("/").text
+
+
+def test_commercial_gate_fresh_app_starts_off_and_rejects_old_session(monkeypatch):
+    first = _gate_web(monkeypatch)
+    with TestClient(first, base_url="http://127.0.0.1:8000") as client:
+        headers = _action_headers(client.get("/"))
+        assert client.post("/commercial-activation/enable", headers=headers).json() == {
+            "status": "authorized"}
+        copied_cookie = client.cookies.get("aclimar_session")
+    assert copied_cookie
+    second = _gate_web(monkeypatch)
+    assert second.state.commercial_gate.is_enabled is False
+    with TestClient(second, base_url="http://127.0.0.1:8000") as client:
+        client.cookies.set("aclimar_session", copied_cookie)
+        response = client.post("/commercial-activation/enable", headers=headers)
+        assert response.status_code == 403
+        assert response.json() == {"status": "invalid_security"}
+        assert second.state.commercial_gate.is_enabled is False
+        assert 'data-path="/commercial-activation/enable"' in client.get("/").text
+        assert second.state.commercial_gate.is_enabled is False
+
+
+def test_gate_control_remains_available_if_email_selector_fails(monkeypatch):
+    app = _gate_web(monkeypatch)
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("synthetic selector failure")
+
+    monkeypatch.setattr("app.web.routes.list_manual_analysis_options", unavailable)
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        page = client.get("/")
+        assert 'data-path="/commercial-activation/enable"' in page.text
+        assert "Existing emails" not in page.text
+        headers = _action_headers(page)
+        response = client.post("/commercial-activation/enable", headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"status": "authorized"}
+
+
 def test_manual_selector_is_read_only_bounded_and_safe(manual_web):
     app, factory, source_id, _ = manual_web
     with TestClient(app, base_url="http://127.0.0.1:8000") as client:

@@ -31,6 +31,11 @@ def _result(code: str) -> JSONResponse:
                         headers=_PRIVATE_HEADERS)
 
 
+def _gate_result(code: str, status_code: int) -> JSONResponse:
+    return JSONResponse({"status": code}, status_code=status_code,
+                        headers=_PRIVATE_HEADERS)
+
+
 def _operational_lock(application):
     try:
         lock = application.state.operational_lock
@@ -110,6 +115,27 @@ async def _manual_analysis(request: Request, intent: str) -> JSONResponse:
     except Exception:
         return _result("unavailable")
 
+
+async def _commercial_activation(request: Request, *, enable: bool) -> JSONResponse:
+    if not validate_protected_request(request, request.headers.get("x-csrf-token")):
+        return _gate_result("invalid_security", 403)
+    if _operational_lock(request.app) is None:
+        return _gate_result("unavailable", 503)
+    if request.scope.get("query_string"):
+        return _gate_result("invalid_request", 400)
+    try:
+        async for chunk in request.stream():
+            if chunk:
+                return _gate_result("invalid_request", 400)
+        gate = request.app.state.commercial_gate
+        if enable:
+            gate.enable()
+        else:
+            gate.disable()
+    except Exception:
+        return _gate_result("unavailable", 503)
+    return _gate_result("authorized" if enable else "blocked", 200)
+
 @router.get("/health")
 def health(): return {"status": "ok"}
 
@@ -134,6 +160,7 @@ def status(request: Request):
     options = ()
     token = None
     if operational:
+        token = issue_csrf_token(request.session)
         try:
             factory = make_session_factory(application.state.settings.database_url)
             try:
@@ -141,11 +168,8 @@ def status(request: Request):
                     factory, application.state.settings.imap.account_scope)
             finally:
                 factory.kw["bind"].dispose()
-            if any(option.state in {"ready", "retry_required"} for option in options):
-                token = issue_csrf_token(request.session)
         except Exception:
             options = ()
-            token = None
     return templates.TemplateResponse(request, "status.html", {
         "status": "ok", "ai_state": "enabled" if ai.enabled else "disabled",
         "provider": ai.provider, "model": ai.model, "endpoint": endpoint,
@@ -163,3 +187,13 @@ async def analyze_email(request: Request):
 @router.post("/analysis/email/retry")
 async def retry_email_analysis(request: Request):
     return await _manual_analysis(request, "retry")
+
+
+@router.post("/commercial-activation/enable")
+async def enable_commercial_analysis(request: Request):
+    return await _commercial_activation(request, enable=True)
+
+
+@router.post("/commercial-activation/disable")
+async def disable_commercial_analysis(request: Request):
+    return await _commercial_activation(request, enable=False)

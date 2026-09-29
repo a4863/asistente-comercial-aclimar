@@ -602,3 +602,82 @@ def test_protected_request_requires_session_csrf_and_same_origin():
     assert not validate_protected_request(_local_request(app), token)
     assert not validate_csrf_token({"csrf_token": 42}, token)
     assert not validate_csrf_token(session, 42)
+
+
+@pytest.mark.parametrize("action", ["enable", "disable"])
+@pytest.mark.parametrize("failure,expected_status,expected_code", [
+    ("missing_session", 403, "invalid_security"),
+    ("forged_session", 403, "invalid_security"),
+    ("expired_session", 403, "invalid_security"),
+    ("missing_csrf", 403, "invalid_security"),
+    ("invalid_csrf", 403, "invalid_security"),
+    ("missing_origin", 403, "invalid_security"),
+    ("foreign_origin", 403, "invalid_security"),
+    ("malformed_origin", 403, "invalid_security"),
+    ("invalid_host", 400, "invalid_host"),
+    ("not_ready", 503, "unavailable"),
+    ("missing_lock", 503, "unavailable"),
+    ("lost_owner", 503, "unavailable"),
+    ("nonempty_body", 400, "invalid_request"),
+    ("nonempty_query", 400, "invalid_request"),
+])
+def test_commercial_gate_posts_fail_closed_before_mutation_or_external_work(
+        monkeypatch, action, failure, expected_status, expected_code):
+    app = create_app()
+    app.state.operational_ready = True
+    app.state.operational_lock = SimpleNamespace(is_owner=True)
+    app.state.credential_store = SimpleNamespace(credential_presence=lambda *_args: "missing")
+    factory = SimpleNamespace(kw={"bind": SimpleNamespace(dispose=lambda: None)})
+    monkeypatch.setattr("app.web.routes.make_session_factory", lambda *_args: factory)
+    monkeypatch.setattr("app.web.routes.list_manual_analysis_options", lambda *_args: ())
+    if action == "disable":
+        app.state.commercial_gate.enable()
+    original_state = app.state.commercial_gate.is_enabled
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        page = client.get("/")
+        token = page.text.split('id="analysis-action-token" value="')[1].split('"')[0]
+        headers = {"Origin": "http://127.0.0.1:8000", "X-CSRF-Token": token}
+        if failure == "missing_session":
+            client.cookies.clear()
+        elif failure == "forged_session":
+            client.cookies.set("aclimar_session", "forged.cookie.signature")
+        elif failure == "expired_session":
+            monkeypatch.setattr("app.security.session.time.time", lambda: 2**31)
+        elif failure == "missing_csrf":
+            headers.pop("X-CSRF-Token")
+        elif failure == "invalid_csrf":
+            headers["X-CSRF-Token"] = "invalid"
+        elif failure == "missing_origin":
+            headers.pop("Origin")
+        elif failure == "foreign_origin":
+            headers["Origin"] = "http://evil.example:8000"
+        elif failure == "malformed_origin":
+            headers["Origin"] = "null"
+        elif failure == "invalid_host":
+            headers["Host"] = "evil.example:8000"
+        elif failure == "not_ready":
+            app.state.operational_ready = False
+        elif failure == "missing_lock":
+            app.state.operational_lock = None
+        elif failure == "lost_owner":
+            app.state.operational_lock.is_owner = False
+
+        def forbidden(*_args, **_kwargs):
+            pytest.fail("gate failure reached provider, credential or persistence")
+
+        with monkeypatch.context() as protected:
+            protected.setattr("app.web.routes.make_session_factory", forbidden)
+            protected.setattr("app.web.routes.OpenAIAnalysis", forbidden)
+            app.state.credential_store = SimpleNamespace(credential_presence=forbidden,
+                                                         get_secret=forbidden)
+            path = f"/commercial-activation/{action}"
+            if failure == "nonempty_query":
+                path += "?mode=global"
+            response = client.post(path, headers=headers,
+                                   content=b"commercial content" if failure == "nonempty_body"
+                                   else None)
+        assert response.status_code == expected_status
+        assert response.json() == ({"detail": expected_code} if failure == "invalid_host"
+                                   else {"status": expected_code})
+        assert app.state.commercial_gate.is_enabled is original_state

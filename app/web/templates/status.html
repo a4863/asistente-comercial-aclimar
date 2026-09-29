@@ -12,6 +12,18 @@
   <dt>Operational</dt><dd>{{ operational }}</dd>
   <dt>Synthetic smoke</dt><dd>{{ smoke }}</dd>
 </dl>
+{% if action_token %}
+<section aria-label="Commercial activation">
+  <p>Global processing is selected. Commercial authorization resets OFF on every restart.</p>
+  {% if commercial == "blocked" %}
+  <button type="button" class="gate-action" data-path="/commercial-activation/enable">Enable commercial analysis (Global)</button>
+  {% else %}
+  <p>Disabling prevents new attempts and retries; it cannot recall an already-sent request.</p>
+  <button type="button" class="gate-action" data-path="/commercial-activation/disable">Disable commercial analysis</button>
+  {% endif %}
+  <p id="gate-result" role="status" aria-live="polite"></p>
+</section>
+{% endif %}
 {% if options %}
 <h2>Existing emails</h2>
 <ul>
@@ -34,6 +46,30 @@
 (() => {
   const token = document.getElementById("analysis-action-token").value;
   const result = document.getElementById("analysis-result");
+  const gateResult = document.getElementById("gate-result");
+  const gateButton = document.querySelector(".gate-action");
+  if (gateButton) {
+    gateButton.addEventListener("click", async () => {
+      gateButton.disabled = true;
+      try {
+        const response = await fetch(gateButton.dataset.path, {
+          method: "POST", credentials: "same-origin",
+          headers: {"X-CSRF-Token": token}
+        });
+        const data = await response.json();
+        const code = ["authorized", "blocked", "invalid_security", "invalid_request", "unavailable"].includes(data.status)
+          ? data.status : "unavailable";
+        gateResult.textContent = code;
+        if (response.ok && (code === "authorized" || code === "blocked")) {
+          window.location.reload();
+        }
+      } catch (_) {
+        gateResult.textContent = "unavailable";
+      } finally {
+        gateButton.disabled = false;
+      }
+    });
+  }
   const allowed = new Set([
     "completed", "completed_replay", "in_progress", "retry_required",
     "retry_not_available", "blocked", "invalid_request", "invalid_target",
