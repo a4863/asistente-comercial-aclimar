@@ -15,6 +15,7 @@ import httpx2
 import httpcore2
 import idna
 import openai as installed_openai
+from openai.types.responses import Response as SDKResponse
 import pydantic
 import pydantic_core
 import pytest
@@ -129,6 +130,25 @@ def _response(payload=None, *, status="completed", part_type="output_text"):
                            refusal="synthetic refusal")
     message = SimpleNamespace(type="message", role="assistant", content=[part])
     return SimpleNamespace(status=status, output=[message], incomplete_details=None)
+
+
+def _sdk_text(text, annotations=None):
+    return {"type": "output_text", "text": text,
+            "annotations": [] if annotations is None else annotations}
+
+
+def _sdk_message(content, *, status="completed"):
+    return {"id": "msg_synthetic", "type": "message", "role": "assistant",
+            "status": status, "content": content}
+
+
+def _sdk_response(output, *, metadata=None):
+    return SDKResponse.model_validate({
+        "id": "resp_synthetic", "created_at": 1.0, "model": "gpt-6-sol",
+        "object": "response", "status": "completed", "output": output,
+        "parallel_tool_calls": False, "tool_choice": "auto", "tools": [],
+        "metadata": metadata,
+    })
 
 
 class FakeCredentials:
@@ -331,6 +351,123 @@ def test_bad_response_fails_without_retry(response, code):
     assert len(factory.responses.calls) == 1
     assert FakeHttpClient.instances[0].close_count == 1
     assert "synthetic refusal" not in str(caught.value)
+
+
+@pytest.mark.parametrize("shape", [
+    "single", "reasoning", "split_parts", "split_messages", "annotated",
+    "message_status_unchanged",
+])
+def test_sdk_structured_text_shapes_decode_without_network(shape):
+    logical_text = json.dumps(_empty())
+    midpoint = len(logical_text) // 2
+    if shape == "reasoning":
+        output = [{"id": "reason_synthetic", "type": "reasoning", "summary": []},
+                  _sdk_message([_sdk_text(logical_text)])]
+    elif shape == "split_parts":
+        output = [_sdk_message([_sdk_text(logical_text[:midpoint]),
+                                _sdk_text(logical_text[midpoint:])])]
+    elif shape == "split_messages":
+        output = [_sdk_message([_sdk_text(logical_text[:midpoint])]),
+                  _sdk_message([_sdk_text(logical_text[midpoint:])])]
+    elif shape == "annotated":
+        annotation = {"type": "file_citation", "file_id": "file_synthetic",
+                      "filename": "synthetic.txt", "index": 0}
+        output = [_sdk_message([_sdk_text(logical_text, [annotation])])]
+    elif shape == "message_status_unchanged":
+        output = [_sdk_message([_sdk_text(logical_text)], status="incomplete")]
+    else:
+        output = [_sdk_message([_sdk_text(logical_text)])]
+    response = _sdk_response(output, metadata={"synthetic": "yes"})
+    assert response.output_text == logical_text
+    factory = FakeFactory([response])
+    assert isinstance(_adapter(factory=factory).analyze(_input()), AnalysisCandidates)
+    assert len(factory.responses.calls) == 1
+    assert len(factory.clients) == FakeHttpClient.instances[0].close_count == 1
+
+
+@pytest.mark.parametrize("case, expected", [
+    ("empty_output", "invalid_output"),
+    ("empty_content", "invalid_output"),
+    ("empty_fragments", "invalid_output"),
+    ("non_string_fragment", "invalid_output"),
+    ("unknown_part", "invalid_output"),
+    ("tool_item", "invalid_output"),
+    ("wrong_role", "invalid_output"),
+    ("malformed_aggregate", "invalid_output"),
+    ("two_documents", "invalid_output"),
+    ("oversize_aggregate", "invalid_output"),
+    ("unicode_aggregate", "invalid_output"),
+    ("semantic_evidence", "invalid_output"),
+    ("refusal_alone", "provider_refusal"),
+    ("refusal_with_text", "provider_refusal"),
+    ("incomplete", "provider_incomplete"),
+    ("failed", "invalid_output"),
+])
+def test_split_output_fail_closed_and_releases_resources(case, expected):
+    response = _response()
+    content = response.output[0].content
+    if case == "empty_output":
+        response.output = []
+    elif case == "empty_content":
+        response.output[0].content = []
+    elif case == "empty_fragments":
+        content[0].text = ""
+        content.append(SimpleNamespace(type="output_text", text=""))
+    elif case == "non_string_fragment":
+        content.append(SimpleNamespace(type="output_text", text=None))
+    elif case == "unknown_part":
+        content.append(SimpleNamespace(type="unrecognized", text="synthetic"))
+    elif case == "tool_item":
+        response.output.append(SimpleNamespace(type="function_call"))
+    elif case == "wrong_role":
+        response.output[0].role = "user"
+    elif case == "malformed_aggregate":
+        content[0].text = "{synthetic-invalid"
+        content.append(SimpleNamespace(type="output_text", text="-json"))
+    elif case == "two_documents":
+        content.append(SimpleNamespace(type="output_text", text=json.dumps(_empty())))
+    elif case == "oversize_aggregate":
+        content[0].text = "x" * 80_000
+        content.append(SimpleNamespace(type="output_text", text="x" * 80_001))
+    elif case == "unicode_aggregate":
+        content[0].text = "synthetic"
+        content.append(SimpleNamespace(type="output_text", text="\ud800"))
+    elif case == "semantic_evidence":
+        payload = _empty()
+        payload["facts"] = [{"fact_type": "synthetic", "value_reference": "synthetic",
+                             "evidence": {"message_alias": "m0", "start_offset": 0,
+                                          "end_offset": 1, "exact_text": "X"}}]
+        content[0].text = json.dumps(payload)
+    elif case == "refusal_alone":
+        content[0].type = "refusal"
+    elif case == "refusal_with_text":
+        content.append(SimpleNamespace(type="refusal", refusal="synthetic refusal"))
+    elif case == "incomplete":
+        response.status = "incomplete"
+    elif case == "failed":
+        response.status = "failed"
+    factory = FakeFactory([response])
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory).analyze(_input())
+    assert caught.value.code == expected
+    assert len(factory.responses.calls) == 1
+    assert len(factory.clients) == FakeHttpClient.instances[0].close_count == 1
+    assert isinstance(_adapter().analyze(_input()), AnalysisCandidates)
+
+
+def test_split_output_failure_does_not_log_or_expose_raw_text(caplog, capsys):
+    marker = "synthetic-sensitive-output-marker"
+    response = _response()
+    response.output[0].content[0].text = "{bad-json-" + marker
+    response.output[0].content.append(SimpleNamespace(type="output_text", text="}"))
+    factory = FakeFactory([response])
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(OpenAIAnalysisError) as caught:
+        _adapter(factory=factory).analyze(_input())
+    captured = capsys.readouterr()
+    assert caught.value.code == "invalid_output"
+    assert marker not in str(caught.value) + caplog.text + captured.out + captured.err
+    assert len(factory.responses.calls) == FakeHttpClient.instances[0].close_count == 1
 
 
 def test_non_json_and_oversize_output_fail_closed():

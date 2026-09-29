@@ -142,15 +142,18 @@ def _structured_text(response: object) -> str:
             if part_kind != "output_text" or not isinstance(getattr(part, "text", None), str):
                 _raise("invalid_output")
             texts.append(part.text)
-    if len(texts) != 1 or not texts[0]:
+    if not texts:
+        _raise("invalid_output")
+    text = "".join(texts)
+    if not text:
         _raise("invalid_output")
     try:
-        size = len(texts[0].encode("utf-8"))
+        size = len(text.encode("utf-8"))
     except UnicodeError:
         _raise("invalid_output")
     if size > MAX_RESPONSE_BYTES:
         _raise("invalid_output")
-    return texts[0]
+    return text
 
 
 class OpenAIAnalysis:
